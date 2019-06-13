@@ -18,6 +18,7 @@
 #1) Use 2007 DEM to be consistent with KH
 #2) Check with Anna to make sure Burn areas make sense
 #3) Convert from sp hell to sf
+#4) Convert to metric units
 
 #1.0 Setup workspace------------------------------------------------------------
 #Clear memory
@@ -116,3 +117,131 @@ fun<-function(WetID){
 
 #Run function
 lapply(seq(1,nrow(burn)), fun)
+
+#4.0 Calculate Storage Capacity-------------------------------------------------
+#4.1 Stage storage relationships------------------------------------------------
+fun<-function(WetID){
+  #Define point of interest
+  pnt<-pnts[pnts$WetID==WetID,]
+  
+  #Define dem and depressions of interest
+  if(gIntersects(pnt, burn_jr)==T){
+    dem=dem_jr
+  }else{
+    dem=dem_jl
+  }
+  
+  #Define subshed 
+  subshed<-raster(paste0(data_dir, "II_work/subshed_",WetID,".asc"))
+  
+  #Devleop stage storage relationship
+  storage<-GIW_stage_storage(
+    subshed = subshed, #Subshed delineated in previous step
+    dem = dem,         #DEM
+    z_max = 2,         #Maximum inundation depth
+    dz = 1/12)         #Inundation Interval
+  
+  #Export
+  storage$WetID<-WetID
+  storage
+}
+
+#Run function
+t0<-Sys.time()
+cl <- makePSOCKcluster(detectCores()) #Create Clusters
+clusterEvalQ(cl, library(raster))   
+clusterEvalQ(cl, library(rgeos))
+clusterExport(cl, c('pnts','burn_jr','dem_burn_jr',"dem_burn_jl", "data_dir",'GIW_stage_storage'), env=.GlobalEnv)  #Send Clusters function with the execute function
+x<-parLapply(cl, seq(1,nrow(burn)), fun) #Run execute Function
+stopCluster(cl)  #Turn clusters off
+tf<-Sys.time()
+tf-t0
+
+#unlist output
+storage<-do.call(rbind,x)
+
+#4.2 Spill point----------------------------------------------------------------
+#Create function to estimate the spill point and print plot 
+fun<-function(WetID){
+  #Define point of interest
+  pnt<-pnts[pnts$WetID==WetID,]
+  
+  #Define dem and depressions of interest
+  if(gIntersects(pnt, burn_jr)==T){
+    dem=dem_burn_jr
+  }else{
+    dem=dem_burn_jl
+  }
+  
+  #Define subshed 
+  subshed<-raster(paste0(data_dir, "II_work/subshed_",WetID,".asc"))
+  #Define Storage Curve
+  storage<-storage[storage$WetID==WetID,]
+  
+  #Calculate max inundation
+  inundation<-GIW_max_inundation(
+    subshed,  #wateshed raster
+    dem, #DEM for the analysis
+    storage   #Storage Curve 
+  )
+  
+  #Create layers for plotting
+  subshed<-rasterToPolygons(subshed, dissolve=T)
+  dem<-crop(dem, subshed)
+  dem<-mask(dem, subshed)  
+  
+  #Estimate Below water surface (using W and Lane 2016)
+  a_ha<-(storage$area[1]*(.3048^2))*0.0001
+  dV_ham=0.25*(a_ha^1.4742)
+  dV<-(dV_ham*10000)*(3.28084^3)
+  storage$volume<-storage$volume+dV
+  
+  #Create Output Plots!~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  png(paste0(scratch_dir,WetID,".png"), 
+      width = 6, height=3, units="in", res=150)
+  
+  #Plot side by side
+  par(mfrow=c(1,2))
+  
+  #Plot Inundation
+  par(mar=c(1,1,1,1))
+  plot(subshed, main=paste0("Wetland = ",pnt$wetland))
+  plot(dem, add=T, legend=F)
+  plot(inundation, add=T, legend=F, col="blue")
+  
+  #Plot stage storage curve
+  par(mar=c(4,4,1,1))
+  par(mgp=c(2.1,1,0))
+  plot(storage$z*12, storage$volume/gArea(subshed)*12, type="n",
+       ps=12, cex.axis=10/12, cex.lab=14/12, 
+       xlab="Relative Wetland Stage [in]", 
+       ylab=expression("Specific Storage [in"^3*"/in"^2*"]"))
+  abline(h=storage$volume[storage$outflow_length>0][1]/gArea(subshed)*12, 
+         lty=2, lwd=2, col="grey30")
+  points(storage$z*12, storage$volume/gArea(subshed)*12,
+         pch=21, col="grey30", bg="grey70", cex=2)
+  
+  #Turn device off
+  dev.off()
+  
+  #Create df of relevant storage capacity information 
+  output<-data.frame(WetID=WetID,
+                     area_subshed_ft2=gArea(subshed),
+                     area_wetland_ft2=storage$area[storage$outflow_length>0][1], 
+                     volume_ft3=storage$volume[storage$outflow_length>0][1])
+  #Export!
+  output
+}
+
+
+#Run function
+output<-lapply(seq(1,nrow(burn)), fun)
+output<-do.call(rbind,output)
+
+#5.0 Export results-------------------------------------------------------------
+#Combine points with output data
+pnts<-pnts@data
+pnts<-left_join(pnts, output)
+
+#Export CSV file
+write_csv(pnts, paste0(data_dir, "III_products/AIK_output.csv"))
