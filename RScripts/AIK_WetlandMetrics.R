@@ -151,7 +151,7 @@ t0<-Sys.time()
 cl <- makePSOCKcluster(detectCores()) #Create Clusters
 clusterEvalQ(cl, library(raster))   
 clusterEvalQ(cl, library(rgeos))
-clusterExport(cl, c('pnts','burn_jr','dem_burn_jr',"dem_burn_jl", "data_dir",'GIW_stage_storage'), env=.GlobalEnv)  #Send Clusters function with the execute function
+clusterExport(cl, c('pnts','burn_jr','dem_jr',"dem_jl", "data_dir",'GIW_stage_storage'), env=.GlobalEnv)  #Send Clusters function with the execute function
 x<-parLapply(cl, seq(1,nrow(burn)), fun) #Run execute Function
 stopCluster(cl)  #Turn clusters off
 tf<-Sys.time()
