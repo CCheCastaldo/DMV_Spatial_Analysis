@@ -5,14 +5,6 @@
 #Purpose: Develop a suite of spatial metrics for AIK's masters thesis
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-#A few quick notes:
-#1) All data is housed in the Palmer Lab subdirectory.  (Choptank/Nate/Storage_Capacity)
-#2) This analysis relies on WBT GIS platform. [https://www.uoguelph.ca/~hydrogeo/Whitebox/download.shtml
-#     Before running this script, users will need to download WBT and define the 
-#     location of both the WBT executable and a scratch workspace
-#3) This anlaysis also relies on the InundationHydrology package, which has to be 
-#     from directly from github. 
-
 #To-do list:
 #0) Update to latest WBT exe
 #1) Use 2007 DEM to be consistent with KH
@@ -25,68 +17,242 @@
 rm(list=ls(all=TRUE))
 
 #Defin relevant working directories
-data_dir<-"//storage.research.sesync.org/palmer-group-data/choptank/Nate/Storage_Capacity/"
-scratch_dir<-"C:\\ScratchWorkspace\\"
-wbt_dir<-"C:/WBT/whitebox_tools"
+data_dir<-"//nfs/palmer-group-data/choptank/Nate/Storage_Capacity/"
 
 #Download packages 
 library(tidyverse)
 library(raster)
 library(sf)
 library(parallel)
-library(devtools)
+library(whitebox)
+library(fasterize)
+library(stars)
 
-#Download package from GIT
-install_github("FloodHydrology/InundationHydRology")
-library(InundationHydRology)
+#Load custom R scripts
+funs<-list.files("functions/")
+for(i in 1:length(funs)){source(paste0('functions/',funs[i]))}
+remove(funs)
+
+#Define projection
+p<-"+proj=utm +zone=17 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"
 
 #Download relevant data 
-dem_jl<-raster(paste0(data_dir,"II_work/jl_dem"))
-dem_jr<-raster(paste0(data_dir,"II_work/jr_dem"))
-pnts<-st_read(paste0(data_dir,"II_Work/AIK_Wetland_Locations.shp"))
+dem<-raster(paste0(data_dir,"I_Data/2007_1m_DEM.tif"))
+  dem[dem<0]<-NA
+  dem<-projectRaster(dem, crs=p)  
 burn<-st_read(paste0(data_dir,"II_Work/wetland_burn.shp"))
+  burn<-st_transform(burn, crs=p)
+pnts<-read_csv(paste0(data_dir, "I_Data/q2_locations.csv"))
+  pnts<-st_as_sf(pnts, coords  = c('X','Y'), crs = 4269) 
+  pnts<-st_transform(pnts, crs=p)
 
 #Add Unique ID to points
 pnts$WetID<-seq(1,nrow(pnts)) 
-burn<-st_join(burn, pnts) %>% dplyr::select(WetID) %>% filter(!is.na(WetID))
 
-#for now convert to sp (I'll need to update code to use sf at a later date)
-pnts<-as_Spatial(pnts)
-burn<-as_Spatial(burn)
-library(rgeos)
-library(rgdal)
+#2.0 Prepare files for delineation----------------------------------------------
+#Steps: 
+  #(1) Filter DEM
+  #(2) Burn Ponds into Raster
+  #(3) Breach depressions
+  #(4) Flow direction analysis
+  #(5) Flow accumulation analysis
 
-#2.0 Burn Wetlands into DEM-----------------------------------------------------
-#Process Jackson Ln property
-mask_jl<-extent(dem_jl)
-burn_jl<-crop(burn, mask_jl)
-dem_burn_jl<-GIW_burn(dem_jl, burn_jl[1,])
-for(i in 2:length(burn_jl)){
-  dem_burn_jl<-GIW_burn(dem_burn_jl, burn_jl[i,])
-}
+#2.1 Create low resolution dem--------------------------------------------------
+writeRaster(dem, paste0(data_dir,"II_Work/dem.tif"), overwrite=T)
+aggregate_raster(input = paste0(data_dir,"II_Work/dem.tif"), 
+                 output = paste0(data_dir,"II_Work/dem_10m.tif"), 
+                 agg_factor = 10)
+dem_lr<-raster(paste0(data_dir,"II_Work/dem_10m.tif"))
+dem_lr[dem_lr<0]<-NA
 
-#Process Jones Rd property
-mask_jr<-extent(dem_jr)
-burn_jr<-crop(burn, mask_jr)
-dem_burn_jr<-GIW_burn(dem_jr, burn_jr[1,])
-for(i in 2:length(burn_jr)){
-  dem_burn_jr<-GIW_burn(dem_burn_jr, burn_jr[i,])
-}
+#2.2 Burn known wetlands into DEM-----------------------------------------------
+#Create burn raster
+burn_grd<-fasterize(burn, dem_lr)
+  burn_grd[burn_grd==1]<-0
+  burn_grd[is.na(burn_grd)]<-1
+
+#Burn into dem
+dem_burn<-dem_lr*burn_grd
+  crs(dem_burn)<-p
+
+#Write burn to scratch workspace
+writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
+
+#2.3 Define depressions (again, low res)----------------------------------------
+#Use the stochastic depression analysis tool!
+stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_burn.tif"), 
+                               output = paste0(data_dir,"II_Work/giws_lr.tif"), 
+                               rmse = 0.18, 
+                               range = 10, 
+                               iterations = 100)
+
+#Reclass raster (any depression that was delineated less than 80% of the time is out!)
+reclass(input = paste0(data_dir,"II_Work/giws_lr.tif"), 
+        output = paste0(data_dir,"II_Work/reclass.tif"), 
+        reclass_vals = "'0;0;0.8'")
+reclass(input = paste0(data_dir,"II_Work/reclass.tif"), 
+        output = paste0(data_dir,"II_Work/reclass.tif"), 
+        reclass_vals = "'1;0.8;1'")
+r<-raster(paste0(data_dir,"II_Work/reclass.tif")) 
+r[r==0]<-NA
+writeRaster(r, paste0(data_dir, "II_Work/reclass_na.tif"), overwrite=T)
+remove(r)
+
+#Identify "clumps" of depressions
+clump(input = paste0(data_dir, "II_Work/reclass_na.tif"), 
+      output = paste0(data_dir, "II_Work/group.tif"), 
+      zero_back = T)
+
+#Identify Clusters greater than 100m2
+c<-raster(paste0(data_dir, "II_Work/group.tif")) 
+c[c==1]<-NA
+c<- c %>% 
+  #Convert to polygon
+  st_as_stars(.) %>% st_as_sf(., merge = TRUE) %>%
+  #Estiamte polygon areas
+  mutate(area = as.numeric(st_area(., by_id=T))) %>%
+  #filter small areas out
+  filter(area>100) 
+st_write(c, paste0(data_dir, "II_Work/giws_lr.shp"), delete_layer=TRUE)
+remove(c)
+
+#2.4 Create low resolution fdr and fac------------------------------------------
+#Breach depressions
+breach_depressions(dem = paste0(data_dir,"II_Work/dem_burn.tif"), 
+                   output = paste0(data_dir,"II_Work/dem_breach.tif"))
+
+#FDR Raster
+d8_pointer(dem = paste0(data_dir,"II_Work/dem_breach.tif"), 
+           output = paste0(data_dir,"II_Work/fdr_lr.tif"))
+
+#FAC Raster
+d8_flow_accumulation(dem = paste0(data_dir,"II_Work/dem_breach.tif"), 
+                     output = paste0(data_dir,"II_Work/fac_lr.tif"))
+
+#import into R workspace
+burn<-raster(paste0(data_dir,"II_Work/dem_burn.tif"))
+breach<-raster(paste0(data_dir,"II_Work/dem_breach.tif"))
+fdr<-raster(paste0(data_dir,"II_Work/fdr_lr.tif"))
+fac<-raster(paste0(data_dir,"II_Work/fac_lr.tif"))
+
+#3.0 Delineate Watersheds-------------------------------------------------------
+#Create function to delineate watershed
+#fun<-function(){}
+
+#Create temporary file
+temp_dir<-paste0(tempfile(),"/")
+dir.create(temp_dir)
+
+
+
+
+
+
+
+
+
 
 #3.0 Delineate Wetlands---------------------------------------------------------
-#3.1 Identify deperessions------------------------------------------------------
-#Identify depressions in DEM
-giws_jl<-GIW_identification(
-  dem=dem_burn_jl,                    #DEM in question
-  min_size=100,                       #Minimum depression size (in map units)
-  workspace="C:\\ScratchWorkspace\\", #Scratch Workspace
-  wbt_path="C:/WBT/whitebox_tools")   #WBG toolbox location
+#Create function to identify depressions
+fun<-function(dem=dem,
+              min_size=5000, #minimum area (in map units)
+              iterations=100, #number of Monte Carlo iterations
+              dem_rmse=0.0607){ #RMSE of 18.5 cm
 
-giws_jr<-GIW_identification(
-  dem=dem_burn_jr,                    #DEM in question
-  min_size=100,                       #Minimum depression size (in map units)
-  workspace="C:\\ScratchWorkspace\\", #Scratch Workspace
-  wbt_path="C:/WBT/whitebox_tools")   #WBG toolbox location
+#Create temporary file
+temp_dir<-paste0(tempfile(),"/")
+dir.create(temp_dir)
+  
+#Write dem to scratch workspace
+writeRaster(dem, paste0(temp_dir, "dem.tif"), overwrite=T)
+
+#Fill single-cell depressions
+fill_single_cell_pits(dem    = paste0(temp_dir, "dem.tif"), 
+                      output = paste0(temp_dir,"dem_fill.tif"))
+
+#Filter the DEM
+edge_preserving_mean_filter(input  = paste0(temp_dir,"dem_fill.tif"), 
+                            output = paste0(temp_dir,"dem_filter.tif"), 
+                            threshold = 100)
+
+#Identify depressions
+stochastic_depression_analysis(dem = paste0(temp_dir,"dem_filter.tif"), 
+                               output = paste0(temp_dir,"depression.tif"), 
+                               rmse = dem_rmse,
+                               range = 100, 
+                               iterations =iterations)
+
+#Reclass raster (any depression that was delineated less than 80% of the time is out!)
+reclass(input = paste0(temp_dir,"depression.tif"), 
+        output = paste0(temp_dir,"reclass.tif"), 
+        reclass_vals = "'0;0;0.8'")
+reclass(input = paste0(temp_dir,"reclass.tif"), 
+        output = paste0(temp_dir,"reclass.tif"), 
+        reclass_vals = "'1;0.8;1'")
+r<-raster(paste0(temp_dir,"reclass.tif")) 
+r[r==0]<-NA
+writeRaster(r, paste0(temp_dir, "reclass_na.tif"), overwrite=T)
+
+#Identify "clumps" of depressions
+clump(input = paste0(temp_dir,"reclass_na.tif"), 
+      output = paste0(temp_dir,"group.tif"), 
+      zero_back = T)
+
+#Identify Clusters greater than 100m2
+w<-raster(paste0(temp_dir,"group.tif")) 
+w[w==1]<-NA
+w<- w %>% 
+  #Convert to polygon
+  st_as_stars(.) %>% st_as_sf(., merge = TRUE) %>%
+  #Estiamte polygon areas
+  mutate(area = as.numeric(st_area(., by_id=T))) %>%
+  #filter small areas out
+  filter(area>min_size) 
+
+#Export
+w
+}
+
+#Apply function 
+giws_jl<-fun(dem=dem_burn_jl)
+giws_jr<-fun(dem=dem_burn_jr)
+
+#combine giws
+giws<-rbind(giws_jl, giws_jr)
+
+#export to data directory
+st_write(giws_jl, paste0(data_dir, "II_Work/giws_jl.shp"))
+st_write(giws_jr, paste0(data_dir, "II_Work/giws_jr.shp"))
+st_write(giws,    paste0(data_dir, "II_Work/giws.shp"))
+
+#4.0 Delinate Watersheds--------------------------------------------------------
+#Create function to delineate watershed
+#fun<-function(n, 
+#              pnts = pnts, 
+#              giws = giws){}
+
+#For testing
+n<-1
+
+#Isolate wetland of interests
+giw<-giws[pnts[n,],]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #3.2 Wetland Subshed Delineation------------------------------------------------
 #Create rapper function for subshed delineation
