@@ -45,7 +45,9 @@ pnts<-read_csv(paste0(data_dir, "I_Data/q2_locations.csv"))
 tnc<-st_read(paste0(data_dir,"I_Data/JL_boundary.shp"))
   tnc<-rbind(tnc, st_read(paste0(data_dir,"I_Data/JR_boundary.shp")))
   tnc<-st_transform(tnc, crs=p)
-
+streams<-st_read(paste0(data_dir,"I_Data/TotalStreamNetwork_UCRW.shp"))
+  streams<-st_transform(streams, crs=p)
+  
 #Add Unique ID to points
 pnts$WetID<-seq(1,nrow(pnts)) 
 
@@ -496,6 +498,7 @@ fun<-function(n, dem, dz, z_max){
   #Assign ID
   df<- df %>%
     mutate(WetID = giw$WetID) %>%
+    mutate(min_ele = cellStats(temp_min, base::min)) %>%
     rename(inun_area = area)
   
   #Export inundation information
@@ -521,9 +524,83 @@ tf<-Sys.time()
 tf-t0
 
 #Join to GIWs
-colnames(output)<-c("z_max", "inun_area", "inun_volume", "outflow_length", "WetID")
+colnames(output)<-c("z_max", "inun_area", "inun_volume", "outflow_length", "WetID", "min_ele")
 giws<-left_join(giws, output)
 
-#7.0 ---------------------------------------------------------------------------
-#Here -- we'll Calculate neighbohood metrics of volume (total storage capacity), 
-#HAND, maybe something about relative to center of mass, etc?
+#Save image as backup 
+save.image("backup.RData")
+
+#7.0 Estimate the distribution of storage capacity------------------------------
+#7.1 Create function------------------------------------------------------------
+fun<-function(
+  n,
+  giws, 
+  watersheds_shp){
+
+  #Filter -9999 values from giw tibble
+  giws<-giws %>% filter(inun_volume>0)
+  
+  #Gather relevant data
+  giw<-giws[n,]
+  subshed<-st_read(paste0(data_dir, "II_Work/",giw$WetID,"_subshed.shp"))
+  watershed<-st_read(paste0(data_dir, "II_Work/",giw$WetID,"_high_res_watershed.shp"))
+  
+  #Identify giws in watershed
+  siblings<-giws[watershed,] %>% filter(WetID!=giw$WetID)
+  
+  #Identify neighborhood [for now, we're defining the neighborhood as adjacent watersheds]
+  neighborhood<-watersheds_shp[st_buffer(watershed, 10),]
+  neighbors<-giws[neighborhood,] %>% filter(WetID!=giw$WetID)
+  
+  #Estiamte storage capacity [units = cm] 
+  s_subshed<-giw$inun_volume/as.numeric(giw$subshed_area)*100
+  s_watershed<-sum(siblings$inun_volume, na.rm=T)/as.numeric(st_area(watershed))*100
+  s_neighborhood<-sum(neighbors$inun_volume, na.rm=T)/sum(as.numeric(st_area(neighborhood)), na.rm=T)*100
+  
+  #Estimate volume ratio
+  s_ratio_ws<-giw$inun_volume/sum(siblings$inun_volume, na.rm=T)
+  s_ratio_nh<-sum(siblings$inun_volume, na.rm=T)/sum(neighbors$inun_volume, na.rm=T)
+  
+  #Estimate vertical difference (units = cm)
+  s_vert_ws<-(mean(siblings$min_ele, na.rm=T) - giw$min_ele)*100
+  s_vert_nh<-(mean(neighbors$min_ele, na.rm=T) - giw$min_ele)*100
+  
+  #gather results
+  t<-tibble(
+    WetID = giw$WetID,
+    s_subshed, 
+    s_watershed,
+    s_neighborhood, 
+    s_ratio_ws, 
+    s_ratio_nh,
+    s_vert_ws, 
+    s_vert_nh
+  )
+  
+  #Export
+  t
+}
+
+#7.2 Execute function-----------------------------------------------------------
+#Create wrapper function w/ tryCatch for error handling
+outside_fun<-function(x){
+  tryCatch(fun(x, giws=giws, watersheds_shp = watersheds_shp), 
+           error = function(e) tibble(WetID = giws$WetID[n],
+                                      s_subshed = NA, 
+                                      s_watershed = NA,
+                                      s_neighborhood = NA, 
+                                      s_ratio_ws = NA, 
+                                      s_ratio_nh = NA,
+                                      s_vert_ws = NA, 
+                                      s_vert_nh = NA))
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+output<-bind_rows(output)
+tf<-Sys.time()
+tf-t0
+
+#Join to GIWs
+giws<-left_join(giws, output)
