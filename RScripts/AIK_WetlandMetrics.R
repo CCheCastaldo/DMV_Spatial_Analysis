@@ -51,7 +51,7 @@ pnts$WetID<-seq(1,nrow(pnts))
 
 #2.0 Identify depressions on TNC Properties-------------------------------------
 #Steps
-  # (1) Filter Raster
+  # (1) Prep Raster
   # (2) Burn AIK sites into DEM
   # (3) Delineate Depressions
   # (4) Filter Depressions
@@ -166,11 +166,12 @@ fdr<-raster(paste0(data_dir,"II_Work/fdr_lr.tif"))
 fac<-raster(paste0(data_dir,"II_Work/fac_lr.tif"))
   crs(fac)<-p
   
-#3.0 Delineate Watersheds-------------------------------------------------------
+#4.0 Delineate Watersheds-------------------------------------------------------
+#4.1 Prep GIWs------------------------------------------------------------------
 #Add Unique ID for tracking purposes
 giws$WetID<-seq(1, nrow(giws))
 
-#3.1 Create function to delineate watershed-------------------------------------
+#4.2 Create function to delineate watershed-------------------------------------
 fun<-function(n, #wetland of interest in pnts dataframe
               giws , #wetlands shp derived from DEM [and informed by manual burn shps]){}
               fac , #flow accumulation raster (low res)
@@ -277,6 +278,11 @@ fun<-function(n, #wetland of interest in pnts dataframe
   #Convert watershed to polygon
   w_hr_shp<- w_hr_grd %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
   
+  #If there are multiple shapes, then combine
+  if(nrow(w_hr_shp)>1){
+    w_hr_shp<-st_union(w_hr_shp)
+  }
+  
   #Add id info and write to output folder
   write_sf(w_hr_shp, paste0(data_dir, "II_Work/",giw$WetID,"_high_res_watershed.shp"), delete_layer = T)
   
@@ -284,7 +290,7 @@ fun<-function(n, #wetland of interest in pnts dataframe
   data.frame(WetID=giw$WetID, ws_area=paste(st_area(w_hr_shp)))
 }
 
-#3.2 Apply function-------------------------------------------------------------
+#4.3 Apply function-------------------------------------------------------------
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
   tryCatch(fun(x, giws=giws, fac=fac,fdr=fdr,dem_hr=dem), 
@@ -294,6 +300,8 @@ outside_fun<-function(x){
 #apply function
 output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
 output<-bind_rows(output)
+
+#Join to master GIW tibble
 giws<-left_join(giws, output)
 
 #Gather shapes and export~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -305,19 +313,21 @@ watersheds<-list.files(paste0(data_dir,"II_work")) %>%
 
 #load those shapes
 watersheds_shp<-st_read(paste0(data_dir,"II_work/", watersheds[1,]))
-watersheds_shp$ID<-substr(watersheds$value[1],1,2)
+watersheds_shp$ID<-watersheds$value[1] %>% str_match_all("[0-9]+") %>% unlist
+jig<-colnames(watersheds_shp)
 for(i in 2:nrow(watersheds)){
   print(i)
   temp_shp<-st_read(paste0(data_dir,"II_work/", watersheds[i,]))
-  temp_shp$ID<-substr(watersheds$value[i],1,2)
+  temp_shp$ID<-watersheds$value[i] %>% str_match_all("[0-9]+") %>% unlist
+  colnames(temp_shp)<-jig
   watersheds_shp<-rbind(watersheds_shp, temp_shp)
 }
 
 #export 
 st_write(watersheds_shp, paste0(data_dir,"III_Products/watersheds.shp"), delete_layer =T)
 
-#4.0 Wetland Subshed Delineation------------------------------------------------
-#4.1 Create function to identify indididual subsheds----------------------------
+#5.0 Wetland Subshed Delineation------------------------------------------------
+#5.1 Create function to identify indididual subsheds----------------------------
 fun<-function(n,dem){
 #Steps
   # (1) Identify watershed
@@ -365,7 +375,7 @@ fun<-function(n,dem){
   data.frame(WetID=giw$WetID, subshed_area=paste(st_area(ws_shp)))
 }
 
-#4.2 Apply function-------------------------------------------------------------
+#5.2 Apply function-------------------------------------------------------------
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
   tryCatch(fun(x, dem=dem), 
@@ -374,19 +384,42 @@ outside_fun<-function(x){
 
 #apply function (~2 minutes on SESYNC server)
 output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
-output<-bind_rows(output)
+output<-bind_rows(output) %>%
+  group_by(WetID) %>%
+  summarise(subshed_area = base::max(subshed_area, na.rm=T))
 
-#------------------
-#Start here and fix randome outputs with 1 and -9999
-#Maybe just delete?
-#-----------------
-
-
+#Merge with GIW tible
 giws<-left_join(giws, output)
 
-#5.0 Calculate Storage Capacity-------------------------------------------------
-#5.1 Create function to estimate storage capacity ------------------------------
-fun<-function(n, dem){
+#5.3 Gather Shapes--------------------------------------------------------------
+#Gather shapes and export~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Make list of watershed shape files
+subsheds<-list.files(paste0(data_dir,"II_work")) %>%
+  enframe() %>%
+  select(value) %>%
+  filter(str_detect(value, "subshed.shp"))
+
+#load those shapes
+subsheds_shp<-st_read(paste0(data_dir,"II_work/", subsheds[1,]))
+subsheds_shp$ID<-subsheds$value[1] %>% str_match_all("[0-9]+") %>% unlist
+colnames(subsheds_shp)<-c("shape","geometry","ID")
+for(i in 2:nrow(subsheds)){
+  print(i)
+  temp_shp<-st_read(paste0(data_dir,"II_work/", subsheds[i,]))
+  if(nrow(temp_shp)>0){
+    temp_shp$ID<-subsheds$value[i] %>% str_match_all("[0-9]+") %>% unlist
+    colnames(temp_shp)<-c("shape","geometry","ID")
+    subsheds_shp<-rbind(subsheds_shp, temp_shp)
+  }
+}
+
+#export 
+st_write(subsheds_shp, paste0(data_dir,"III_Products/subsheds.shp"), delete_layer =T)
+
+
+#6.0 Calculate Storage Capacity-------------------------------------------------
+#6.1 Create function to estimate storage capacity ------------------------------
+fun<-function(n, dem, dz, z_max){
   #Steps
   # (1) Gather GIW, DEM, and subshed data
   # (2) Crop DEM + Locate minum elevation in depression
@@ -399,7 +432,7 @@ fun<-function(n, dem){
   giw<-giws[n,]
 
   #Call subshed shape
-  w_shp<-st_read(paste0(data_dir, "II_Work/",giw$WetID,"_high_res_watershed.shp"))
+  w_shp<-st_read(paste0(data_dir, "II_Work/",giw$WetID,"_subshed.shp"))
 
   #Crop DEM to subshed
   temp<-crop(dem, w_shp)
@@ -469,10 +502,10 @@ fun<-function(n, dem){
   df
 }
   
-#5.2 Apply function-------------------------------------------------------------
+#6.2 Apply function-------------------------------------------------------------
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
-  tryCatch(fun(x, dem=dem), 
+  tryCatch(fun(x, dem=dem, dz = 0.05, z_max=2), 
            error = function(e) data.frame(z = -9999, 
                                           inun_area = -9999, 
                                           volume = -9999,
@@ -488,17 +521,9 @@ tf<-Sys.time()
 tf-t0
 
 #Join to GIWs
-#giws<-left_join(giws, output)
+colnames(output)<-c("z_max", "inun_area", "inun_volume", "outflow_length", "WetID")
+giws<-left_join(giws, output)
 
-#6.0 ---------------------------------------------------------------------------
-
-#Before you start here -- deal with odd "1" from output from #1 [you could even just delete!]
-
+#7.0 ---------------------------------------------------------------------------
 #Here -- we'll Calculate neighbohood metrics of volume (total storage capacity), 
 #HAND, maybe something about relative to center of mass, etc?
-
-  
-  
-  
-  
-
