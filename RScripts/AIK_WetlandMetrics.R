@@ -5,11 +5,17 @@
 #Purpose: Develop a suite of spatial metrics for AIK's masters thesis
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+#Note for tomorrow (parking downhill)
+
+
 #To-do list:
 #1) Check with Anna to make sure Burn areas make sense
   #Tree island bay    
 
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #1.0 Setup workspace------------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 #Clear memory
 rm(list=ls(all=TRUE))
 
@@ -17,6 +23,7 @@ rm(list=ls(all=TRUE))
 data_dir<-"//nfs/palmer-group-data/choptank/Nate/Spatial_Analysis/"
 
 #Download packages 
+library(gstat)
 library(stars)
 library(fasterize)
 library(whitebox)
@@ -47,11 +54,11 @@ tnc<-st_read(paste0(data_dir,"I_Data/JL_boundary.shp"))
   tnc<-st_transform(tnc, crs=p)
 streams<-st_read(paste0(data_dir,"I_Data/TotalStreamNetwork_UCRW.shp"))
   streams<-st_transform(streams, crs=p)
+  streams<-st_crop(streams, dem)
   
-#Add Unique ID to points
-pnts$WetID<-seq(1,nrow(pnts)) 
-
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #2.0 Identify depressions on TNC Properties-------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Steps
   # (1) Prep Raster
   # (2) Burn AIK sites into DEM
@@ -71,11 +78,11 @@ edge_preserving_mean_filter(input = paste0(data_dir,"II_Work/dem_fill.tif"),
                             output = paste0(data_dir,"II_Work/dem_filter.tif"), 
                             threshold = 1)
 
-#2.2 Burn AIK Sites into DEM----------------------------------------------------
+#2.2 Burn Streams and AIK Sites into DEM----------------------------------------
 #read dem_filter into R memory
 dem_filter<-raster(paste0(data_dir,"II_Work/dem_filter.tif"))
 
-#Create burn raster
+#Create burn raster (AIK Sites)
 burn_grd<-fasterize(burn, dem_filter)
 burn_grd[burn_grd==1]<-0.5
 burn_grd[is.na(burn_grd)]<-1
@@ -83,6 +90,14 @@ burn_grd[is.na(burn_grd)]<-1
 #Burn into dem
 dem_burn<-dem_filter*burn_grd
 crs(dem_burn)<-p
+
+#Create burn raster (streams)
+burn_grd<-fasterize(streams, dem_burn)
+burn_grd[burn_grd==1]<-0
+burn_grd[is.na(burn_grd)]<-1
+
+#burn into dem
+dem_burn<-dem_filter*burn_grd
 
 #Export burned dem to workspace
 writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
@@ -127,6 +142,8 @@ giws<-st_read(paste0(data_dir, "II_Work/giws.shp"))
 giws<-giws %>%
   #Remove small depressions
   filter(AREA>500) %>%
+  #Remove oddly large depressions
+  filter(AREA<1e5) %>%
   #Remove ditched depressions
   mutate(p_a_ratio = AREA/PERIMETER) %>%
   filter(p_a_ratio>3)
@@ -137,7 +154,9 @@ giws<-giws[st_buffer(tnc, 1000),]
 #Export updated shapefile
 st_write(giws, paste0(data_dir, "II_Work/giws.shp"), delete_layer=TRUE)
 
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.0 Prepare files for delineation----------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Steps: 
   # (1) Aggregate to lower resolution DEM
   # (2) Breach depressions
@@ -168,7 +187,10 @@ fdr<-raster(paste0(data_dir,"II_Work/fdr_lr.tif"))
 fac<-raster(paste0(data_dir,"II_Work/fac_lr.tif"))
   crs(fac)<-p
   
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #4.0 Delineate Watersheds-------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 #4.1 Prep GIWs------------------------------------------------------------------
 #Add Unique ID for tracking purposes
 giws$WetID<-seq(1, nrow(giws))
@@ -280,10 +302,14 @@ fun<-function(n, #wetland of interest in pnts dataframe
   #Convert watershed to polygon
   w_hr_shp<- w_hr_grd %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
   
-  #If there are multiple shapes, then combine
-  if(nrow(w_hr_shp)>1){
-    w_hr_shp<-st_union(w_hr_shp)
-  }
+  #Clip snippets
+  w_hr_shp<-w_hr_shp %>%
+    mutate(ws_area = st_area(w_hr_shp, by_element=T)) %>%
+    filter(ws_area == base::max(ws_area)) %>%
+    select(-ws_area)
+  
+  #Add WetID for reference later...
+  w_hr_shp$WetID<-giw$WetID
   
   #Add id info and write to output folder
   write_sf(w_hr_shp, paste0(data_dir, "II_Work/",giw$WetID,"_high_res_watershed.shp"), delete_layer = T)
@@ -296,7 +322,7 @@ fun<-function(n, #wetland of interest in pnts dataframe
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
   tryCatch(fun(x, giws=giws, fac=fac,fdr=fdr,dem_hr=dem), 
-           error = function(e) data.frame(WetID=x, ws_area="-999"))
+           error = function(e) data.frame(WetID=x, ws_area=NA))
 }
   
 #apply function
@@ -306,7 +332,7 @@ output<-bind_rows(output)
 #Join to master GIW tibble
 giws<-left_join(giws, output)
 
-#Gather shapes and export~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#4.4 Combine shapes and export--------------------------------------------------
 #Make list of watershed shape files
 watersheds<-list.files(paste0(data_dir,"II_work")) %>%
   enframe() %>%
@@ -328,7 +354,9 @@ for(i in 2:nrow(watersheds)){
 #export 
 st_write(watersheds_shp, paste0(data_dir,"III_Products/watersheds.shp"), delete_layer =T)
 
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #5.0 Wetland Subshed Delineation------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #5.1 Create function to identify indididual subsheds----------------------------
 fun<-function(n,dem){
 #Steps
@@ -341,35 +369,56 @@ fun<-function(n,dem){
   giw<-giws[n,]
   
   #Download watershed shape
-  ws_shp<-st_read(paste0(data_dir, "II_Work/",giw$WetID, "_high_res_watershed.shp"))
+  ws_shp<-watersheds_shp %>% filter(ID == giw$WetID)
   ws_grd<-fasterize(ws_shp, dem)
   ws_grd<-crop(ws_grd, ws_shp)
   
-  #Identify upslope depressions
+  #Identify upslope depressions and remove any overlapping GIWs
   giw_upslope<-giws[ws_shp,] %>% filter(WetID!=giw$WetID)
   
-  #if there are upslope wetlands, then substract their subsheds!!!!
-  if(nrow(giw_upslope)>0){
-    #Iteratively substract uplsope subshed areas
-    for(i in 1:nrow(giw_upslope)){
-      #Identify upslope subshed
-      temp_shp<-st_read(paste0(data_dir, "II_Work/",giw_upslope$WetID[i], "_high_res_watershed.shp"))
-      temp_grd<-fasterize(temp_shp, ws_grd)
-      
-      #Substract upslope subshed from larger watershed
-      temp_grd[temp_grd==1]<-0
-      temp_grd[is.na(temp_grd)]<-1
-      ws_grd<-ws_grd*temp_grd
-    }
+  #Remove wetlands that overlap with the focal wetland
+  if(nrow(giw[giw_upslope,])>0){
+    giw_upslope<-giw_upslope %>% filter(WetID!=giw_upslope[giw,]$WetID)
+  }
+  
+  #Identify upslope watersheds
+  ws_upslope<-watersheds_shp %>% filter(ID %in% giw_upslope$WetID) %>% st_cast(., "MULTIPOLYGON")
+  
+  #Clip downstream watersheds from upslope wetland shape
+  if(nrow(ws_upslope)>0){
+    ws_upslope<-ws_upslope %>%
+      mutate(area = st_area(ws_upslope, by_element=T)) %>%
+      filter(area < st_area(ws_shp, by_element=F)) %>%
+      select(-area)
+  }
+  
+  #If there are upslope wetlands, then substract their subsheds!!!!
+  if(nrow(ws_upslope)>0){
+    
+    #[F]asterise upslope watershed grd
+    ws_up_grd<-fasterize(ws_upslope, ws_grd)
+    
+    #Convert to bianary raster
+    ws_up_grd[ws_up_grd==1]<-0
+    ws_up_grd[is.na(ws_up_grd)]<-1
+    
+    #Delete from ws_grd using raster algebra!
+    ws_grd<-ws_grd*ws_up_grd
     
     #Convert subshed grd to shp
     ws_grd[ws_grd==0]<-NA
     ws_shp<-ws_grd %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
-    
-    #Just incase there are multiple shapes
-    ws_shp<-ws_shp[giw,]
   }
   
+  #Add WetID to the shape
+  ws_shp$WetID<-giw$WetID
+  
+  #Clip snippets
+  ws_shp<-ws_shp %>%
+    mutate(subshed_area = st_area(ws_shp, by_element=T)) %>%
+    filter(subshed_area == base::max(subshed_area)) %>%
+    select(-subshed_area)
+
   #Add id info and write to output folder
   write_sf(ws_shp, paste0(data_dir, "II_Work/",giw$WetID,"_subshed.shp"), delete_layer = T)
   
@@ -381,7 +430,7 @@ fun<-function(n,dem){
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
   tryCatch(fun(x, dem=dem), 
-           error = function(e) data.frame(WetID=x, subshed_area="-9999"))
+           error = function(e) data.frame(WetID=x, subshed_area=NA))
 }
 
 #apply function (~2 minutes on SESYNC server)
@@ -393,8 +442,7 @@ output<-bind_rows(output) %>%
 #Merge with GIW tible
 giws<-left_join(giws, output)
 
-#5.3 Gather Shapes--------------------------------------------------------------
-#Gather shapes and export~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.3 Gather Shapes and export---------------------------------------------------
 #Make list of watershed shape files
 subsheds<-list.files(paste0(data_dir,"II_work")) %>%
   enframe() %>%
@@ -404,13 +452,14 @@ subsheds<-list.files(paste0(data_dir,"II_work")) %>%
 #load those shapes
 subsheds_shp<-st_read(paste0(data_dir,"II_work/", subsheds[1,]))
 subsheds_shp$ID<-subsheds$value[1] %>% str_match_all("[0-9]+") %>% unlist
-colnames(subsheds_shp)<-c("shape","geometry","ID")
 for(i in 2:nrow(subsheds)){
   print(i)
   temp_shp<-st_read(paste0(data_dir,"II_work/", subsheds[i,]))
   if(nrow(temp_shp)>0){
     temp_shp$ID<-subsheds$value[i] %>% str_match_all("[0-9]+") %>% unlist
-    colnames(temp_shp)<-c("shape","geometry","ID")
+    if("wtrshd_" %in% colnames(temp_shp)){
+      temp_shp <- temp_shp %>% rename(layer='wtrshd_')
+    }
     subsheds_shp<-rbind(subsheds_shp, temp_shp)
   }
 }
@@ -418,8 +467,10 @@ for(i in 2:nrow(subsheds)){
 #export 
 st_write(subsheds_shp, paste0(data_dir,"III_Products/subsheds.shp"), delete_layer =T)
 
-
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #6.0 Calculate Storage Capacity-------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 #6.1 Create function to estimate storage capacity ------------------------------
 fun<-function(n, dem, dz, z_max){
   #Steps
@@ -434,7 +485,7 @@ fun<-function(n, dem, dz, z_max){
   giw<-giws[n,]
 
   #Call subshed shape
-  w_shp<-st_read(paste0(data_dir, "II_Work/",giw$WetID,"_subshed.shp"))
+  w_shp<-subsheds_shp %>% filter(ID == giw$WetID)
 
   #Crop DEM to subshed
   temp<-crop(dem, w_shp)
@@ -509,10 +560,10 @@ fun<-function(n, dem, dz, z_max){
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
   tryCatch(fun(x, dem=dem, dz = 0.05, z_max=2), 
-           error = function(e) data.frame(z = -9999, 
-                                          inun_area = -9999, 
-                                          volume = -9999,
-                                          outflow_length = -9999, 
+           error = function(e) data.frame(z = NA, 
+                                          inun_area = NA, 
+                                          volume = NA,
+                                          outflow_length = NA, 
                                           WetID=x))
 }
 
@@ -530,7 +581,15 @@ giws<-left_join(giws, output)
 #Save image as backup 
 save.image("backup.RData")
 
-#7.0 Estimate the distribution of storage capacity------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#7.0 Estimate the storage metrics-----------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Clear memory
+rm(list=ls(all=TRUE))
+
+#load backup
+load("backup.RData")
+
 #7.1 Create function------------------------------------------------------------
 fun<-function(
   n,
@@ -549,8 +608,8 @@ fun<-function(
   siblings<-giws[watershed,] %>% filter(WetID!=giw$WetID)
   
   #Identify neighborhood [for now, we're defining the neighborhood as adjacent watersheds]
-  neighborhood<-watersheds_shp[st_buffer(watershed, 10),]
-  neighbors<-giws[neighborhood,] %>% filter(WetID!=giw$WetID)
+  neighborhood<-subsheds_shp[st_buffer(watershed, 10),]
+  neighbors<-giws %>% filter(WetID %in% neighborhood$WetID) %>% filter(WetID!=giw$WetID)
   
   #Estiamte storage capacity [units = cm] 
   s_subshed<-giw$inun_volume/as.numeric(giw$subshed_area)*100
@@ -604,3 +663,129 @@ tf-t0
 
 #Join to GIWs
 giws<-left_join(giws, output)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#8.0 Estimate HAND--------------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# 8.1 Prep Stream Layer -------------------------------------------------------
+#Create low res DEM
+writeRaster(dem,paste0(data_dir, "II_Work/dem_hr.tif"), overwrite=T)
+aggregate_raster(input  = paste0(data_dir, "II_Work/dem_hr.tif"), 
+                 output = paste0(data_dir, "II_Work/dem_lr.tif"), 
+                 agg_factor = 10)
+dem_lr<-raster(paste0(data_dir, "II_Work/dem_lr.tif"))
+dem_lr[dem_lr<0]<-NA
+
+#[F]asterize stream layer
+stream_grd<-fasterize(streams, dem_lr)
+
+#Create XYZ tibble of stream info
+stream_ele<-stream_grd*dem_lr
+stream_ele<-rasterToPoints(stream_ele) 
+stream_ele<-as_tibble(stream_ele)
+
+#create blank raster for interpollation
+jig<-dem_lr*0
+
+#Interpolate
+stream_idw<-gstat(id="layer", formula=layer~1, locations=~x+y, data=stream_ele, nmax=7, set=list(idp=4.2))
+stream_idw<-interpolate(jig, stream_idw)
+crs(stream_idw)<-p
+
+#8.2 Create function to estimate hand-------------------------------------------
+fun<-function(n,
+              giws,
+              stream_idw,
+              dem){
+
+  #isolate giw in question
+  giw<-giws[n,]
+  
+  #crop stream_idw raster to giw
+  dem_temp<-crop(dem, giw)
+  stream_temp<-crop(stream_idw, giw)
+  stream_temp<-raster::resample(stream_temp, dem_temp)
+  stream_temp<-mask(stream_temp, giw)
+  
+  #estimate hand
+  hand<-giw$min_ele - cellStats(stream_temp, base::min)
+  
+  #Export HAND estimate 
+  tibble(WetID = giw$WetID, 
+         hand_m = hand)
+}
+
+#8.3 Execute function-----------------------------------------------------------
+#Create wrapper function w/ tryCatch for error handling
+outside_fun<-function(x){
+  tryCatch(fun(x, giws=giws, stream_idw = stream_idw, dem=dem), 
+           error = function(e) tibble(WetID = giws$WetID[n],
+                                      hand_m = NA))
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+output<-bind_rows(output)
+tf<-Sys.time()
+tf-t0
+
+#Join to GIWs
+giws<-left_join(giws, output)
+
+#Save image
+save.image("backup.RData")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#9.0 Exploratory Analysis-------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Clear memory
+rm(list=ls(all=TRUE))
+
+#load backup
+load("backup.RData")
+
+#9.1 Condense data to Anna's Sites----------------------------------------------
+#Spatial join
+df<-st_join(pnts, giws)
+
+#9.2 Print spatial data --------------------------------------------------------
+
+#Create function to examine spatial output
+#for testing
+n<-1
+
+#Isolate sampling point
+p<-df[n,]
+
+#Isolate associated spatial data
+giw<-giws %>% filter(WetID == p$WetID)
+watershed<-watersheds_shp %>% filter(WetID==p$WetID)
+dem_temp<-crop(dem,watershed)
+dem_temp<-mask(dem_temp,watershed)
+
+
+
+
+
+
+#Examine vertically-based relationships
+plot(df$mean_stock_kgC_per_m2~df$hand_m)
+plot(df$mean_stock_kgC_per_m2~df$s_vert_nh)
+plot(df$mean_stock_kgC_per_m2~df$s_vert_ws)
+
+#Examine storage-based relatinships
+plot(df$mean_stock_kgC_per_m2~df$s_subshed)
+plot(df$mean_stock_kgC_per_m2~df$s_watershed)
+plot(df$mean_stock_kgFe_per_m2~df$s_neighborhood)
+
+#Examine density-based relatinships
+plot(df$mean_stock_kgC_per_m2~df$s_ratio_ws)
+plot(df$mean_stock_kgC_per_m2~df$s_ratio_nh)
+
+
+
+
+
+
