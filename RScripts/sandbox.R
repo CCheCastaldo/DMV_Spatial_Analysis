@@ -185,11 +185,12 @@ for(i in 2:n_slices){
 }
 
 #Plot 
-nodes %>% filter(!node %in% merge_to) %>% select(node) %>% plot()
+nodes %>% filter(spawned==0) %>% select(node) %>% plot()
 
 #Next steps
 # (1) Add filter for size
 # (2) Create functin for individual depression
 
 
-
+#Reference to Wu 2019
+#https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
