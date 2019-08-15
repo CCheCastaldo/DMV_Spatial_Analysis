@@ -5,8 +5,10 @@
 #Purpose: Develop a suite of spatial metrics for AIK's masters thesis
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-#Note for tomorrow (parking downhill)
-
+#Note for tomorrow (parking downhill):
+#  Burned stream network into DEM and ran depression analysis.  Make sure it works
+#  Go bakc to the analysis of storage capacity.  check on where your pulling numbers from
+#  Create plots exploratory analysis plots for Anna
 
 #To-do list:
 #1) Check with Anna to make sure Burn areas make sense
@@ -354,9 +356,18 @@ for(i in 2:nrow(watersheds)){
 #export 
 st_write(watersheds_shp, paste0(data_dir,"III_Products/watersheds.shp"), delete_layer =T)
 
+#Save Image
+save.image("backup.RData")
+
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #5.0 Wetland Subshed Delineation------------------------------------------------
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Clear memory
+rm(list=ls(all=TRUE))
+
+#load image
+load("backup.RData")
+
 #5.1 Create function to identify indididual subsheds----------------------------
 fun<-function(n,dem){
 #Steps
@@ -451,25 +462,29 @@ subsheds<-list.files(paste0(data_dir,"II_work")) %>%
 
 #load those shapes
 subsheds_shp<-st_read(paste0(data_dir,"II_work/", subsheds[1,]))
-subsheds_shp$ID<-subsheds$value[1] %>% str_match_all("[0-9]+") %>% unlist
+subsheds_shp<-subsheds_shp %>% mutate(WetID = subsheds$value[1] %>% str_match_all("[0-9]+") %>% unlist) %>% select(WetID)
 for(i in 2:nrow(subsheds)){
   print(i)
   temp_shp<-st_read(paste0(data_dir,"II_work/", subsheds[i,]))
-  if(nrow(temp_shp)>0){
-    temp_shp$ID<-subsheds$value[i] %>% str_match_all("[0-9]+") %>% unlist
-    if("wtrshd_" %in% colnames(temp_shp)){
-      temp_shp <- temp_shp %>% rename(layer='wtrshd_')
-    }
-    subsheds_shp<-rbind(subsheds_shp, temp_shp)
-  }
+  temp_shp<-temp_shp %>% mutate(WetID = subsheds$value[i] %>% str_match_all("[0-9]+") %>% unlist) %>% select(WetID)
+  subsheds_shp<-rbind(subsheds_shp, temp_shp)
+  remove(temp_shp)
 }
 
 #export 
 st_write(subsheds_shp, paste0(data_dir,"III_Products/subsheds.shp"), delete_layer =T)
 
+#Save Image
+save.image("backup.RData")
+
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #6.0 Calculate Storage Capacity-------------------------------------------------
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Clear memory
+rm(list=ls(all=TRUE))
+
+#load image
+load("backup.RData")
 
 #6.1 Create function to estimate storage capacity ------------------------------
 fun<-function(n, dem, dz, z_max){
@@ -485,7 +500,7 @@ fun<-function(n, dem, dz, z_max){
   giw<-giws[n,]
 
   #Call subshed shape
-  w_shp<-subsheds_shp %>% filter(ID == giw$WetID)
+  w_shp<-subsheds_shp %>% filter(WetID == giw$WetID)
 
   #Crop DEM to subshed
   temp<-crop(dem, w_shp)
