@@ -112,85 +112,108 @@ plot(dem_filter)
 plot(st_geometry(giws), add=T, col="blue")
 
 #4.0 Define "leaf" or "child" depressions---------------------------------------
-#For testing identify dragonfly bay complex
-giw<-giws %>% filter(AREA==base::max(AREA))
-n_slices<-10
+#Reference to Wu et al [2019] code: 
+#https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
 
-#Create function to return conditional raster
-con<-function(condition, trueValue, falseValue){
-  return(condition * trueValue + (!condition)*falseValue)
-}
+#4.1 Create function to execute level set method individual basins~~~~~~~~~~~~~~
+fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
 
-#Crop DEM
-temp<-crop(dem_filter, giw)
-temp<-mask(temp, giw)
-
-#Create Minimum Raster
-temp_min<-temp*0+minValue(temp)
-temp_min@crs<-temp@crs
-
-#Estimate maximum depth
-z_max<-cellStats(temp-temp_min, base::max)
-
-#Create shape of maximum extent
-max_inun<-con(temp>(temp_min+z_max), 0, 1) %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
-
-#Create levels tibble
-nodes<-max_inun %>%
-  mutate(node=1, 
-         z = z_max,
-         merge_to = NA, 
-         spawned = 0) %>%
-  select(node, z, merge_to, spawned)
-
-#Drain the complex and identify spawns
-for(i in 2:n_slices){
-  #Define inundation depth
-  z<-z_max-(z_max/n_slices)*i
+  #Identify GIW
+  giw<-giws[n,]
   
-  #define inundated areas
-  inun<-con(temp>(temp_min+z),0,1)
-  inun<-raster::clump(inun) %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
+  #Create function to return conditional raster
+  con<-function(condition, trueValue, falseValue){
+    return(condition * trueValue + (!condition)*falseValue)
+  }
   
-  #Determine if any new nodes spawned 
-  for(j in 1:nrow(nodes)){
-    #Identify temp node
-    node_temp<-nodes[j,]
+  #Crop DEM
+  temp<-crop(dem_filter, giw)
+  temp<-mask(temp, giw)
+  
+  #Create Minimum Raster
+  temp_min<-temp*0+minValue(temp)
+  temp_min@crs<-temp@crs
+  
+  #Estimate maximum depth
+  z_max<-cellStats(temp-temp_min, base::max)
+  
+  #Create shape of maximum extent
+  max_inun<-con(temp>(temp_min+z_max), 0, 1) %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
+  
+  #Create levels tibble
+  nodes<-max_inun %>%
+    mutate(node=1, 
+           z = z_max,
+           merge_to = NA, 
+           spawned = 0) %>%
+    select(node, z, merge_to, spawned)
+  
+  #Drain the complex and identify spawns
+  for(i in 2:n_slices){
+    #Define inundation depth
+    z<-z_max-(z_max/n_slices)*i
     
-    #Identify inundation within node
-    node_inun<-inun[node_temp,]
+    #define inundated areas
+    inun<-con(temp>(temp_min+z),0,1)
+    inun<-raster::clump(inun) %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
     
-    #If >2 shpae and the shape hasn't already spawned, then add spawn to node list
-    if(nrow(node_inun)>1 & node_temp$spawned==0){
-      #Add info to inundation shape
-      node_inun<- node_inun %>%
-        mutate(node = node_temp$node, 
-               z = z, 
-               merge_to = node_temp$node, 
-               spawned = 0) %>%
-        select(node, z, merge_to, spawned)
+    #Determine if any new nodes spawned 
+    for(j in 1:nrow(nodes)){
+      #Identify temp node
+      node_temp<-nodes[j,]
       
-      #Add node id
-      for(i in 1:nrow(node_inun)){
-        node_inun$node[i]<-base::max(nodes$node)+i
+      #Identify inundation within node
+      node_inun<-inun[node_temp,]
+      
+      #Filter out small wetlands
+      node_inun<-node_inun %>%
+        mutate(size=as.numeric(st_area(node_inun))) %>%
+        filter(size>max_size)
+      
+      #If >2 shpae and the shape hasn't already spawned, then add spawn to node list
+      if(nrow(node_inun)>1 & node_temp$spawned==0){
+        #Add info to inundation shape
+        node_inun<- node_inun %>%
+          mutate(node = node_temp$node, 
+                 z = z, 
+                 merge_to = node_temp$node, 
+                 spawned = 0) %>%
+          select(node, z, merge_to, spawned)
+        
+        #Add node id
+        for(i in 1:nrow(node_inun)){
+          node_inun$node[i]<-base::max(nodes$node)+i
+        }
+        
+        #Add spawn indicator
+        nodes$spawned[j]<-1
+        
+        #Merge with nodes
+        nodes<-rbind(nodes, node_inun)
       }
-      
-      #Add spawn indicator
-      nodes$spawned[j]<-1
-      
-      #Merge with nodes
-      nodes<-rbind(nodes, node_inun)
     }
   }
+
+#Export nodes
+nodes
 }
 
-#Plot 
-nodes %>% filter(spawned==0) %>% select(node) %>% plot()
+#4.2 Apply function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+outside_fun<-function(x){
+  tryCatch(fun(x, giws, dem, max_size = 250, n_slices = 10), 
+           error = function(e) NA)
+}
 
-#Next steps
-# (1) Add filter for size
-# (2) Create functin for individual depression
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+giws<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+giws<-do.call(rbind, output)
+tf<-Sys.time()
+tf-t0
 
+#4.3 Plot for Funzies
+plot(dem)
+giws %>% filter(spawned == NA) %>% st_geometry() %>% plot(., add=T)
+giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="blue")
+ 
 
-#Reference to Wu 2019
-#https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
