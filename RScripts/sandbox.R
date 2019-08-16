@@ -34,23 +34,39 @@ p<-"+proj=utm +zone=17 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"
 dem<-raster(paste0(data_dir,"I_Data/dem_jr"))
 dem[dem<0]<-NA
 dem<-projectRaster(dem, crs=p)  
+streams<-st_read(paste0(data_dir, "I_Data/streams_jr.shp"))
 
 #2.0 Filter the DEM-------------------------------------------------------------
-#2.1 Fill Single Cell Pitts
+#2.1 Fill Single Cell Pitts~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Export DEM to workspace
-writeRaster(dem, paste0(data_dir,"II_Work/dem_test.tif"), overwrite=T)
+writeRaster(dem, paste0(data_dir,"II_Work/dem.tif"), overwrite=T)
 
 #Fill single cell pits
-fill_single_cell_pits(dem=paste0(data_dir,"II_Work/dem_test.tif"), 
+fill_single_cell_pits(dem=paste0(data_dir,"II_Work/dem.tif"), 
                       output = paste0(data_dir,"II_Work/dem_fill.tif"))
 
 #Read raster back into workspace
 dem_fill<-raster(paste0(data_dir,"II_Work/dem_fill.tif"))
 
-#2.2 Filter DEM
+#2.2 Filter DEM~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Apply simple gausian filter to smooth random errors from DEM
 dem_filter<- focal(dem_fill, w=focalWeight(dem, 3, "Gauss"))
 crs(dem_filter)<-p
+
+#2.3 Burn Streams into DEM~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Write Raster to workspace
+dem_filter[is.na(dem_filter)]<-0
+writeRaster(dem_filter, paste0(data_dir, "II_Work/dem_filter.tif"), overwrite=T)
+
+#Convert streams to single polyline
+streams_grd<-fasterize(streams, dem_filter)
+streams<-rasterToPolygons(streams_grd) %>% st_as_sf()
+st_write(streams, paste0(data_dir, "II_Work/streams.shp"), delete_layer=T)
+
+#burn streams 
+fill_burn(dem = paste0(data_dir, "II_Work/dem.tif"),
+          streams = paste0(data_dir, "II_Work/streams.shp"),
+          output = paste0(data_dir, "II_Work/dem_burn.tif"), verbose=T)
 
 #3.0 Define "Root" Depressions--------------------------------------------------
 #3.1 Use the Stochastic Deprresion Tool to identify deprresions
@@ -74,19 +90,10 @@ reclass(input = paste0(data_dir,"II_Work/reclass.tif"),
         reclass_vals = "'1;0.8;1'")
 
 #Convert 0 to NA
-r<-raster(paste0(data_dir,"II_Work/reclass.tif")) 
-r[r==0]<-NA
-crs(r)<-p
-writeRaster(r, paste0(data_dir, "II_Work/reclass_na.tif"), overwrite=T)
-remove(r)
-
-#Identify "clumps" of depressions
-clump(input = paste0(data_dir, "II_Work/reclass_na.tif"), 
-      output = paste0(data_dir, "II_Work/group.tif"), 
-      zero_back = T)
+giws<-raster(paste0(data_dir,"II_Work/reclass.tif")) 
+giws<-raster::clump(giws)
 
 #Export as polygon
-giws<-raster(paste0(data_dir, "II_Work/group.tif")) 
 giws[giws==1]<-NA
 giws<- giws %>% st_as_stars(.) %>% st_as_sf(., merge = TRUE)
 
@@ -117,7 +124,7 @@ plot(st_geometry(giws), add=T, col="blue")
 
 #4.1 Create function to execute level set method individual basins~~~~~~~~~~~~~~
 fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
-
+  
   #Identify GIW
   giw<-giws[n,]
   
@@ -193,9 +200,9 @@ fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
       }
     }
   }
-
-#Export nodes
-nodes
+  
+  #Export nodes
+  nodes
 }
 
 #4.2 Apply function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -207,13 +214,13 @@ outside_fun<-function(x){
 #apply function (~ minutes on SESYNC server)
 t0<-Sys.time()
 giws<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
-giws<-do.call(rbind, output)
+giws<-do.call(rbind, giws)
 tf<-Sys.time()
 tf-t0
 
-#4.3 Plot for Funzies
+#4.3 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 plot(dem)
-giws %>% filter(spawned == NA) %>% st_geometry() %>% plot(., add=T)
+giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T)
 giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="blue")
- 
+
 
