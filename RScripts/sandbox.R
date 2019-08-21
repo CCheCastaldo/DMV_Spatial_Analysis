@@ -5,7 +5,13 @@
 #Purpose: Examine 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+#To-do
+#1) Make GIWS "Merge To" collumn reference a WetID
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #1.0 Setup workspace------------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Clear memory
 rm(list=ls(all=TRUE))
 
@@ -36,7 +42,9 @@ dem[dem<0]<-NA
 dem<-projectRaster(dem, crs=p)  
 streams<-st_read(paste0(data_dir, "I_Data/streams_jr.shp"))
 
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #2.0 Filter the DEM-------------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #2.1 Fill Single Cell Pitts~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Export DEM to workspace
 writeRaster(dem, paste0(data_dir,"II_Work/dem.tif"), overwrite=T)
@@ -54,27 +62,32 @@ dem_filter<- focal(dem_fill, w=focalWeight(dem, 3, "Gauss"))
 crs(dem_filter)<-p
 
 #2.3 Burn Streams into DEM~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Write Raster to workspace
-dem_filter[is.na(dem_filter)]<-0
-writeRaster(dem_filter, paste0(data_dir, "II_Work/dem_filter.tif"), overwrite=T)
-
 #Convert streams to single polyline
 streams_grd<-fasterize(streams, dem_filter)
-streams<-rasterToPolygons(streams_grd) %>% st_as_sf()
-st_write(streams, paste0(data_dir, "II_Work/streams.shp"), delete_layer=T)
 
-#burn streams 
-fill_burn(dem = paste0(data_dir, "II_Work/dem.tif"),
-          streams = paste0(data_dir, "II_Work/streams.shp"),
-          output = paste0(data_dir, "II_Work/dem_burn.tif"), verbose=T)
+#Create upland mask
+upland_grd<-streams_grd*0
+upland_grd[is.na(upland_grd)]<-1
+upland_grd[upland_grd==0]<-NA
 
+#Add addition raster to DEM
+dem_upland<- dem_filter*upland_grd
+
+#Fill dem_add
+writeRaster(dem_upland, paste0(data_dir, "II_Work/dem_upland.tif"), overwrite=T)
+fill_missing_data(input = paste0(data_dir, "II_Work/dem_upland.tif"), 
+                  output = paste0(data_dir, "II_Work/dem_burn.tif"))
+dem_burn<-raster(paste0(data_dir, "II_Work/dem_burn.tif"))
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.0 Define "Root" Depressions--------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.1 Use the Stochastic Deprresion Tool to identify deprresions
 #Export fitlered DEM to workspace
-writeRaster(dem_filter, paste0(data_dir,"II_Work/dem_filter.tif"), overwrite=T)
+#writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
 
 #Apply stochastic depressin analysis tool
-stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_filter.tif"), 
+stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_burn.tif"), 
                                output = paste0(data_dir,"II_Work/giws.tif"), 
                                rmse = 0.18, 
                                range = 10, 
@@ -118,7 +131,9 @@ giws<-giws %>%
 plot(dem_filter)
 plot(st_geometry(giws), add=T, col="blue")
 
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #4.0 Define "leaf" or "child" depressions---------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Reference to Wu et al [2019] code: 
 #https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
 
@@ -218,9 +233,283 @@ giws<-do.call(rbind, giws)
 tf<-Sys.time()
 tf-t0
 
+#4.3 Give GIWs uniquie ID~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+giws$WetID<-seq(1, nrow(giws))
+
 #4.3 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 plot(dem)
-giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T)
-giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="blue")
+streams %>% plot(., col="dark blue", add=T)
+giws %>% st_geometry() %>% plot(., add=T, lty=2)
+giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.0 Define connectivity between child depressions------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.1 Create flow accumulation and flow direction rasters~~~~~~~~~~~~~~~~~~~~~~~~
+#Export raster to workspace
+writeRaster(dem_burn, paste0(data_dir, "dem.tif"), overwrite=T)
+
+#Execute breach tool
+breach_depressions(dem = paste0(data_dir,"dem.tif"), 
+                   output = paste0(data_dir,"dem_breach.tif"), 
+                   fill_pits = TRUE)
+
+#Execute WBT flow accumulation raster
+d8_flow_accumulation(dem = paste0(data_dir,"dem_breach.tif"), 
+                     output = paste0(data_dir,"fac.tif"))
+
+d8_pointer(dem = paste0(data_dir, "dem_breach.tif"), 
+           output = paste0(data_dir, "fdr.tif"))
+
+#Pull fac back into R environment
+fac<-raster(paste0(data_dir, "fac.tif"))
+fdr<-raster(paste0(data_dir, "fdr.tif"))
+
+#5.2 Create functin to identify "down gradient" wetland~~~~~~~~~~~~~~~~~~~~~~~~~
+fun<-function(n,
+              giws,
+              fac,
+              fdr){
+
+  #Identify giw of interest 
+  giw<- giws[n,]
+  
+  #If a leaf or branch wetland, skip!
+  if(is.na(giw$merge_to)){
+  
+    #Create temporary workspace
+    scratch_dir<-paste0(tempfile(),"/")
+    dir.create(scratch_dir)
+    
+    #Find max fac point within giw
+    fac_giw<-crop(fac, as_Spatial(giw))
+    fac_giw<-mask(fac_giw, as_Spatial(giw))
+    
+    #create pour point
+    pp<-rasterToPoints(fac_giw) %>% 
+      #convert to tibble
+      as_tibble(.) %>%
+      #filter to just max fac value
+      filter(fac == base::max(fac, na.rm=T)) %>%
+      #Select first row
+      slice(1) %>%
+      #Make pour point an sf shape
+      st_as_sf(., coords = c("x", "y"), crs = st_crs(giw))
+    
+    #Export files to scratch dir
+    writeRaster(fdr, paste0(scratch_dir, "fdr.tif"), overwrite=T)
+    write_sf(pp, paste0(scratch_dir,"pp.shp"), delete_layer = T)
+    
+    #Execute WBT flowpaths functin
+    trace_downslope_flowpaths(seed_pts = paste0(scratch_dir,"pp.shp"), 
+                              d8_pntr  = paste0(scratch_dir, "fdr.tif"), 
+                              output   = paste0(scratch_dir, "flowpath.tif"))
+    
+    #Read flowpath raster into R workspace
+    flowpath_grd<-raster(paste0(scratch_dir, "flowpath.tif")) 
+    
+    #Convert flowpath raster to sf shape
+    flowpath_shp <- flowpath_grd %>% st_as_stars() %>% st_as_sf(., merge = TRUE)
+    
+    #Identify downstream giws (root GIWS only)
+    giws_ds<-giws[flowpath_shp,] %>% filter(is.na(merge_to)) %>% filter(WetID != giw$WetID)
+    
+    #Convert to points
+    giw_bndry<- giws_ds %>% select(WetID) %>% st_cast(., "POINT")
+    
+    #Estimate flow accumulation along flowpath
+    fac_fp<-flowpath_grd*fac
+    
+    #Estimate downstream wetland [i.e., shape with minimum flowpath fac value]
+    if(nrow(giws_ds)>0){
+      output<-giw_bndry %>%
+        #Extract flowpath fac data for downstream giw boundaries
+        mutate(fac = raster::extract(fac_fp, .)) %>%
+        #select minimum point 
+        filter(fac == base::min(fac, na.rm=T)) %>% slice(1) %>%
+        #Create output collumns 
+        mutate(flow_to = WetID, 
+               WetID = giw$WetID) %>% 
+        #Convert to tibble
+        as_tibble() %>%
+        #Select collumns of interest
+        select(WetID, flow_to) 
+    }else{
+      output<-tibble(WetID = giw$WetID, 
+                      flow_to = NA)
+    }
+    
+    #Delete temp file
+    unlink(scratch_dir, recursive = T)
+    
+  }else{
+    output<-tibble(WetID = giw$WetID, 
+                    flow_to = NA)
+  }
+  
+  #Export output
+  output
+}
+
+#5.3 Apply function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+outside_fun<-function(x){
+  tryCatch(fun(x, giws, fac, fdr), 
+           error = function(e) NA)
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+output<-do.call(rbind, output)
+tf<-Sys.time()
+tf-t0
+
+#Merge output with giws tibble
+giws<-left_join(giws, output)
+
+#5.4 Create flowpath lines for plotting~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Define seed points
+seeds<- giws %>% 
+  #Filter to root giws only
+  filter(is.na(merge_to)) %>%
+  #Select unique ID for each polygon
+  select(WetID) %>% 
+  #Convert to points
+  st_cast(., "POINT") %>%
+  #Extract FAC raster value at each point
+  mutate(fac = raster::extract(fac, .)) %>%
+  #Select max fac point for each wetland
+  group_by(WetID) %>%
+  filter(fac == base::max(fac, na.rm=T))
+
+#write seeds to workspace
+st_write(seeds, paste0(data_dir, "seeds.shp"), delete_layer = TRUE)
+
+#Execute WBT flowpaths function
+trace_downslope_flowpaths(seed_pts = paste0(data_dir,"seeds.shp"), 
+                          d8_pntr  = paste0(data_dir, "fdr.tif"), 
+                          output   = paste0(data_dir, "flowpath.tif"))
+
+#Read flowpath raster into R environment
+flowpath<-raster(paste0(data_dir, "flowpath.tif"))
+
+#Convert to bianary raster
+flowpath<-flowpath*0+1
+
+#Substract wetland areas
+giws_grd<-(fasterize(giws, dem)*0)
+giws_grd[is.na(giws_grd)]<-1
+giws_grd[giws_grd==0]<-NA
+flowpath<-flowpath*giws_grd
+
+#Convert to vector
+flowpath<-flowpath %>% st_as_stars(.) %>% st_as_sf(., merge = TRUE)
+
+#5.5 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+plot(dem)
+streams %>% plot(., col="dodgerblue4", add=T)
+giws %>% st_geometry() %>% plot(., add=T, lty=2)
+giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
+flowpath %>% st_geometry() %>% plot(., add=T, lcol="dodgerblue1")
+seeds %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.0 Watershed Delineation------------------------------------------------------
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.1 Define pour points for all root and leaf wetlands~~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.1.1 Create flowpath raster (yes, this is replicate from above)'''''''''''''''
+#Define seed points
+seeds<- giws %>% st_cast(., "POINT") 
+
+#write seeds to workspace
+st_write(seeds, paste0(data_dir, "seeds.shp"), delete_layer = TRUE)
+
+#Execute WBT flowpaths function
+trace_downslope_flowpaths(seed_pts = paste0(data_dir,"seeds.shp"), 
+                          d8_pntr  = paste0(data_dir, "fdr.tif"), 
+                          output   = paste0(data_dir, "flowpath.tif"))
+
+#Read flowpath raster into R environment
+fp<-raster(paste0(data_dir, "flowpath.tif"))*0+1
+
+#6.1.2 Define pourpoint along flowpath for each wetland'''''''''''''''''''''''''
+#Add fac information to flowpath raster
+fp<-fac*fp
+
+#Create pp 
+giws_grd<- giws %>%
+  #Select non "branch" wetland shpaes
+  filter(is.na(merge_to) | (merge_to>0 & spawned == 0)) %>%
+  #Create raster where values correspond to WetID
+  fasterize(., raster = dem, field = 'WetID')
+  
+#Estiamte pourpoint 
+pp<-fp %>% 
+  #Convert to sf points object
+  rasterToPoints(.) %>%
+  as_tibble(.) %>%
+  st_as_sf(., coords = c('x','y'), crs=p) %>% 
+  rename(fac=layer) %>%
+  #Add WetID data
+  mutate(WetID = raster::extract(giws_grd, .))%>%
+  #Select the max fac per WetID
+  na.omit() %>%
+  group_by(WetID) %>%
+  filter(fac == base::max(fac, na.rm=T)) %>%
+  select(WetID)
+
+#6.2 Delineate subsheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Write shpaes to workspace
+st_write(pp, paste0(data_dir, "pp.shp"))
+
+#Conduct watershed analysis
+watershed(d8_pntr = paste0(data_dir, "fdr.tif"), 
+          pour_pts = paste0(data_dir,"pp.shp"), 
+          output = paste0(data_dir,"subshed.tif"))
+
+#Read subsheds into R environment
+subsheds<-raster(paste0(data_dir,"subshed.tif"))
+
+#Convert to polygon
+subsheds<-subsheds %>% st_as_stars(.) %>% st_as_sf(., merge=T) %>% rename(WetID=subshed) 
+
+#6.3 Delineate watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Create a temporary workspace
+scratch_dir<-paste0(tempfile(),"/")
+dir.create(scratch_dir)
+
+#Run WBT unnested watershed delineation tool
+unnest_basins(d8_pntr = paste0(data_dir, "fdr.tif"), 
+              pour_pts = paste0(data_dir,"pp.shp"), 
+              output = paste0(scratch_dir,"watershed.tif"))
+
+#Create list of raster files
+files<-list.files(scratch_dir)
+
+#Read basins and convert to polygons
+watersheds<-raster(paste0(scratch_dir,files[1])) %>% 
+  st_as_stars(.) %>% st_as_sf(., merge=T) %>%
+  rename(WetID = substr(files[1],1, nchar(files[1])-4))
+for(i in 2:length(files)){
+  print(i)
+  temp<-raster(paste0(scratch_dir,files[i])) %>% 
+    st_as_stars(.) %>% st_as_sf(., merge=T) %>%
+    rename(WetID = substr(files[i],1, nchar(files[i])-4))
+  watersheds<-rbind(watersheds, temp)
+}
+
+#Delete temporary workspace
+unlink(scratch_dir, recursive = T)
 
 
+#6.4 Estimate area metrics~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+#6.5 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+plot(dem)
+streams %>% plot(., col="dodgerblue4", add=T)
+giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T, lty=2, col="dodgerblue4")
+giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
+subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
+flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
+pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
