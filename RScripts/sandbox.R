@@ -7,10 +7,10 @@
 
 #To-do
 #1) Make GIWS "Merge To" collumn reference a WetID
-
+#Create seperate merge polygong for simpler calcs
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#1.0 Setup workspace------------------------------------------------------------
+#1.0 Setup workspace============================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Clear memory
 rm(list=ls(all=TRUE))
@@ -43,9 +43,9 @@ dem<-projectRaster(dem, crs=p)
 streams<-st_read(paste0(data_dir, "I_Data/streams_jr.shp"))
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#2.0 Filter the DEM-------------------------------------------------------------
+#2.0 Filter the DEM=============================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#2.1 Fill Single Cell Pitts~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#2.1 Fill Single Cell Pitts-----------------------------------------------------
 #Export DEM to workspace
 writeRaster(dem, paste0(data_dir,"II_Work/dem.tif"), overwrite=T)
 
@@ -56,12 +56,12 @@ fill_single_cell_pits(dem=paste0(data_dir,"II_Work/dem.tif"),
 #Read raster back into workspace
 dem_fill<-raster(paste0(data_dir,"II_Work/dem_fill.tif"))
 
-#2.2 Filter DEM~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#2.2 Filter DEM-----------------------------------------------------------------
 #Apply simple gausian filter to smooth random errors from DEM
 dem_filter<- focal(dem_fill, w=focalWeight(dem, 3, "Gauss"))
 crs(dem_filter)<-p
 
-#2.3 Burn Streams into DEM~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#2.3 Burn Streams into DEM------------------------------------------------------
 #Convert streams to single polyline
 streams_grd<-fasterize(streams, dem_filter)
 
@@ -80,9 +80,9 @@ fill_missing_data(input = paste0(data_dir, "II_Work/dem_upland.tif"),
 dem_burn<-raster(paste0(data_dir, "II_Work/dem_burn.tif"))
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#3.0 Define "Root" Depressions--------------------------------------------------
+#3.0 Define "Root" Depressions==================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#3.1 Use the Stochastic Deprresion Tool to identify deprresions
+#3.1 Use the Stochastic Deprresion Tool to identify deprresions-----------------
 #Export fitlered DEM to workspace
 #writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
 
@@ -93,7 +93,7 @@ stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_burn.tif"),
                                range = 10, 
                                iterations = 1000)
 
-#3.2 Define depression based on threshold of occurence in stochastic procedure
+#3.2 Define depression based on threshold of occurence in stochastic procedure----
 #Reclass raster (any depression that was delineated less than 80% of the time is out!)
 reclass(input = paste0(data_dir,"II_Work/giws.tif"), 
         output = paste0(data_dir,"II_Work/reclass.tif"), 
@@ -113,7 +113,7 @@ giws<- giws %>% st_as_stars(.) %>% st_as_sf(., merge = TRUE)
 #Write polygon shapes to workspace
 st_write(giws, paste0(data_dir, "II_Work/giws.shp"), delete_layer=TRUE)
 
-#3.3 Filter depressions
+#3.3 Filter depressions---------------------------------------------------------
 #Filter by area and P:A Ratio
 polygon_perimeter(input=paste0(data_dir, "II_Work/giws.shp"))
 polygon_area(input=paste0(data_dir, "II_Work/giws.shp"))
@@ -127,17 +127,16 @@ giws<-giws %>%
   mutate(p_a_ratio = AREA/PERIMETER) %>%
   filter(p_a_ratio>2)
 
-#3.4 Plot for funzies
-plot(dem_filter)
-plot(st_geometry(giws), add=T, col="blue")
+#3.4 Add Unique Identifier to each GIW------------------------------------------ 
+giws$WetID<-seq(1, nrow(giws))
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#4.0 Define "leaf" or "child" depressions---------------------------------------
+#4.0 Define merging patterns within depressions================================-
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Reference to Wu et al [2019] code: 
 #https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
 
-#4.1 Create function to execute level set method individual basins~~~~~~~~~~~~~~
+#4.1 Create function to execute level set method individual basins--------------
 fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
   
   #Identify GIW
@@ -164,11 +163,11 @@ fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
   
   #Create levels tibble
   nodes<-max_inun %>%
-    mutate(node=1, 
+    mutate(WetID=giw$WetID, 
            z = z_max,
            merge_to = NA, 
            spawned = 0) %>%
-    select(node, z, merge_to, spawned)
+    select(WetID, z, merge_to, spawned)
   
   #Drain the complex and identify spawns
   for(i in 2:n_slices){
@@ -196,15 +195,15 @@ fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
       if(nrow(node_inun)>1 & node_temp$spawned==0){
         #Add info to inundation shape
         node_inun<- node_inun %>%
-          mutate(node = node_temp$node, 
+          mutate(WetID = node_temp$WetID, 
                  z = z, 
-                 merge_to = node_temp$node, 
+                 merge_to = node_temp$WetID, 
                  spawned = 0) %>%
-          select(node, z, merge_to, spawned)
+          select(WetID, z, merge_to, spawned)
         
         #Add node id
-        for(i in 1:nrow(node_inun)){
-          node_inun$node[i]<-base::max(nodes$node)+i
+        for(k in 1:nrow(node_inun)){
+          node_inun$WetID[k]<-paste0(giw$WetID,"-",i,"-",j,"-",k)
         }
         
         #Add spawn indicator
@@ -216,11 +215,14 @@ fun<-function(n, giws, dem, max_size = 250, n_slices = 10){
     }
   }
   
+  #Add infomration about root wetland
+  nodes$root_giw<-giw$WetID
+  
   #Export nodes
   nodes
 }
 
-#4.2 Apply function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#4.2 Apply function-------------------------------------------------------------
 outside_fun<-function(x){
   tryCatch(fun(x, giws, dem, max_size = 250, n_slices = 10), 
            error = function(e) NA)
@@ -233,19 +235,47 @@ giws<-do.call(rbind, giws)
 tf<-Sys.time()
 tf-t0
 
-#4.3 Give GIWs uniquie ID~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-giws$WetID<-seq(1, nrow(giws))
+#4.3 Convert Unique GIW IDs to numeric format-----------------------------------
+#Create "change" tibble
+index<-giws %>% 
+  #Highlight ID of branch and leaf wetlands (i.e., ones with "-")
+  filter(str_detect(WetID, "-")) %>%
+  #create new list of new IDs
+  mutate(NewID = seq(base::max(as.numeric(paste(giws$WetID)), na.rm=T)+1,  #Max WetID + 1 
+                     base::max(as.numeric(paste(giws$WetID)), na.rm=T)+nrow(.))) %>%  #Max WetID + number of spawned wetlands
+  #Make NewID a character to mach WetID [for now!]
+  mutate(NewID=paste(NewID)) %>%
+  #Select old and new IDs
+  as_tibble() %>%
+  select(WetID, NewID)
 
-#4.3 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-plot(dem)
-streams %>% plot(., col="dark blue", add=T)
-giws %>% st_geometry() %>% plot(., add=T, lty=2)
-giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
+#Update values in WetID collumn
+giws<-giws %>% 
+  #left join index
+  left_join(., index) %>% 
+  #conditionally chnage WetID value
+  mutate(WetID = if_else(is.na(NewID), WetID, NewID)) %>%
+  #Convert WetID to numeric
+  mutate(WetID = as.numeric(paste(WetID))) %>%
+  #Remove NewID Collumn
+  select(-NewID)
+
+#Update merge_to collumn
+index<-index %>% rename(merge_to = WetID)
+giws<-giws %>% 
+  #left join index
+  left_join(., index) %>% 
+  #conditionally chnage WetID value
+  mutate(merge_to = if_else(is.na(NewID), merge_to, NewID)) %>%
+  #Convert WetID to numeric
+  mutate(merge_to = as.numeric(paste(merge_to))) %>%
+  #Remove NewID Collumn
+  select(-NewID)
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#5.0 Define connectivity between child depressions------------------------------
+#5.0 Define connectivity between wetlands=======================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#5.1 Create flow accumulation and flow direction rasters~~~~~~~~~~~~~~~~~~~~~~~~
+#5.1 Create flow accumulation and flow direction rasters------------------------
 #Export raster to workspace
 writeRaster(dem_burn, paste0(data_dir, "dem.tif"), overwrite=T)
 
@@ -265,7 +295,7 @@ d8_pointer(dem = paste0(data_dir, "dem_breach.tif"),
 fac<-raster(paste0(data_dir, "fac.tif"))
 fdr<-raster(paste0(data_dir, "fdr.tif"))
 
-#5.2 Create functin to identify "down gradient" wetland~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.2 Create functin to identify "down gradient" wetland-------------------------
 fun<-function(n,
               giws,
               fac,
@@ -351,7 +381,7 @@ fun<-function(n,
   output
 }
 
-#5.3 Apply function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.3 Apply function-------------------------------------------------------------
 outside_fun<-function(x){
   tryCatch(fun(x, giws, fac, fdr), 
            error = function(e) NA)
@@ -367,7 +397,7 @@ tf-t0
 #Merge output with giws tibble
 giws<-left_join(giws, output)
 
-#5.4 Create flowpath lines for plotting~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.4 Create flowpath lines for plotting-----------------------------------------
 #Define seed points
 seeds<- giws %>% 
   #Filter to root giws only
@@ -405,7 +435,7 @@ flowpath<-flowpath*giws_grd
 #Convert to vector
 flowpath<-flowpath %>% st_as_stars(.) %>% st_as_sf(., merge = TRUE)
 
-#5.5 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#5.5 Plot for funzies-----------------------------------------------------------
 plot(dem)
 streams %>% plot(., col="dodgerblue4", add=T)
 giws %>% st_geometry() %>% plot(., add=T, lty=2)
@@ -414,10 +444,10 @@ flowpath %>% st_geometry() %>% plot(., add=T, lcol="dodgerblue1")
 seeds %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#6.0 Watershed Delineation------------------------------------------------------
+#6.0 Watershed Delineation======================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#6.1 Define pour points for all root and leaf wetlands~~~~~~~~~~~~~~~~~~~~~~~~~~
-#6.1.1 Create flowpath raster (yes, this is replicate from above)'''''''''''''''
+#6.1 Define pour points for all root and leaf wetlands--------------------------
+#6.1.1 Create flowpath raster (yes, this is replicate from above)~~~~~~~~~~~~~~~
 #Define seed points
 seeds<- giws %>% st_cast(., "POINT") 
 
@@ -432,7 +462,7 @@ trace_downslope_flowpaths(seed_pts = paste0(data_dir,"seeds.shp"),
 #Read flowpath raster into R environment
 fp<-raster(paste0(data_dir, "flowpath.tif"))*0+1
 
-#6.1.2 Define pourpoint along flowpath for each wetland'''''''''''''''''''''''''
+#6.1.2 Define pourpoint along flowpath for each wetland~~~~~~~~~~~~~~~~~~~~~~~~~
 #Add fac information to flowpath raster
 fp<-fac*fp
 
@@ -458,7 +488,7 @@ pp<-fp %>%
   filter(fac == base::max(fac, na.rm=T)) %>%
   select(WetID)
 
-#6.2 Delineate subsheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.2 Delineate subsheds---------------------------------------------------------
 #Write shpaes to workspace
 st_write(pp, paste0(data_dir, "pp.shp"))
 
@@ -473,7 +503,7 @@ subsheds<-raster(paste0(data_dir,"subshed.tif"))
 #Convert to polygon
 subsheds<-subsheds %>% st_as_stars(.) %>% st_as_sf(., merge=T) %>% rename(WetID=subshed) 
 
-#6.3 Delineate watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.3 Delineate watersheds-------------------------------------------------------
 #Create a temporary workspace
 scratch_dir<-paste0(tempfile(),"/")
 dir.create(scratch_dir)
@@ -501,11 +531,34 @@ for(i in 2:length(files)){
 #Delete temporary workspace
 unlink(scratch_dir, recursive = T)
 
+#6.4 Estimate area metrics------------------------------------------------------
+#6.4.1 Estimate subshed area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+subshed_area<-subsheds %>%
+  #estimate area
+  mutate(subshed_area_m2 = st_area(., by_element=T)) %>%
+  #Get rid of units
+  mutate(subshed_area_m2 = as.numeric(subshed_area_m2)) %>%
+  #Convert to tibble
+  as_tibble(.) %>%
+  select(WetID, subshed_area_m2)
 
-#6.4 Estimate area metrics~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Join to GIWS tibble
+giws<-left_join(giws, subshed_area)
 
+#6.4.2 Estimate watershed area area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+watershed_area<-watersheds %>%
+  #estimate area
+  mutate(watershed_area_m2 = st_area(., by_element=T)) %>%
+  #Get rid of units
+  mutate(watershed_area_m2 = as.numeric(watershed_area_m2)) %>%
+  #Convert to tibble
+  as_tibble(.) %>%
+  select(WetID, watershed_area_m2)
 
-#6.5 Plot for funzies~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Join to GIWS tibble
+giws<-left_join(giws, watershed_area)
+
+#6.5 Plot for funzies-----------------------------------------------------------
 plot(dem)
 streams %>% plot(., col="dodgerblue4", add=T)
 giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T, lty=2, col="dodgerblue4")
@@ -513,3 +566,117 @@ giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerb
 subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
 flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
 pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#7.0 Estimtate Storage Capacity=================================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#7.1 Create function to estimate storage capacity-------------------------------
+fun<-function(n, 
+              giws, 
+              dem){
+
+  #Identify giw of interest
+  giw<-giws[n,]
+  
+  #Convert to raster
+  dem_giw<-crop(dem, giw)
+  dem_giw<-mask(dem_giw, giw)
+  
+  #Create max raster
+  max_giw<-dem_giw*0+cellStats(dem_giw, base::max)
+  
+  #Estimate volume between max_giw and dem_giw rasters
+  depth_giw<-max_giw - dem_giw
+  volume_m3<-cellStats(depth_giw, base::sum)*res(depth_giw)[1]*res(depth_giw)[2]
+  
+  #Export output
+  tibble(WetID = giw$WetID, 
+         volume_m3)
+}
+
+
+#7.2 Execute function-----------------------------------------------------------
+outside_fun<-function(x){
+  tryCatch(fun(x, giws, dem), 
+           error = function(e) NA)
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+output<-do.call(rbind, output)
+tf<-Sys.time()
+tf-t0
+
+#Merge output with giws tibble
+giws<-left_join(giws, output)
+
+#7.3 Estimate aggregegate storage capacity metrics------------------------------
+#7.3.2 Individual Wetlands~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Estimate hsc for "leaf" wetlands
+output<-giws %>% as_tibble() %>% 
+  #Select lowest subunit of wetland (i.e.,a leaf)
+  filter(spawned==0) %>%
+  #Estimate Storage Capacity
+  mutate(wetland_hsc_cm = volume_m3/subshed_area_m2*100) %>%
+  #Select collumns for output
+  select(WetID, wetland_hsc_cm)
+
+#Join to GIWs tibble
+giws<-left_join(giws, output)
+
+#7.3.2 Merged Wetlands~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Estimate hsc for merged wetlands [only max merge]
+output<-giws %>% as_tibble() %>% 
+  #Select lowest subunit of wetland (i.e.,a leaf)
+  filter(spawned!=0 & WetID==root_giw) %>%
+  #Estimate Storage Capacity
+  mutate(merged_hsc_cm = volume_m3/subshed_area_m2*100) %>%
+  #Select collumns for output
+  select(WetID, merged_hsc_cm)
+
+#Join to GIWs tibble
+giws<-left_join(giws, output)
+
+#7.3.3 Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Use a spatial join function for now [graduate to network analysis later?]
+
+#Creat function to find wetlands within a given wateshed
+#fun<-function(n, giws, watersheds)
+
+#Select of interest 
+giw<-giws %>% slice(n)
+
+#Define its WetID [for later use]
+WetID<-giw$WetID
+
+#Identify root wetland
+#Is this a root wetlands?
+if(giw$WetID != giw$root_giw){
+  #If not, redefine giw as its root wetland
+  giw<-giws %>% filter(WetID == giw$root_giw)
+}
+
+#Identify watershed
+watershed<-watersheds %>% filter(WetID == giw$WetID)
+
+#Welp...that's a good place to quit.  My watershed IDs and WetIDs are a mis-match. Soo..
+#  tomorrow: (1) Fix that shit, 
+#            (2) Identify all wetlands withint watershed by their centroids
+#            (3) Sum everything up adn divide by the ws_area!
+#  then, calculate vertical metrics and send to Anna.
+
+#Identify matching watershed
+
+#Create centroid of giws
+centroids<-giws %>% st_centroid(., by_element=T) %>% select(WetID)
+
+
+
+
+#7.3.2 Subshed~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#7.3.3 Subshed~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+giws %>% filter(spawned!=0 & is.na(merge_to)) %>% plot()
