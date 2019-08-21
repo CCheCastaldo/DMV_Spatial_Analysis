@@ -664,6 +664,7 @@ watershed<-watersheds %>% filter(WetID == giw$WetID)
 #  tomorrow: (1) Fix that shit, 
 #            (2) Identify all wetlands withint watershed by their centroids
 #            (3) Sum everything up adn divide by the ws_area!
+#            (4) Remember, when you spit it out, use WetID defined above as ID...
 #  then, calculate vertical metrics and send to Anna.
 
 #Identify matching watershed
@@ -671,12 +672,3 @@ watershed<-watersheds %>% filter(WetID == giw$WetID)
 #Create centroid of giws
 centroids<-giws %>% st_centroid(., by_element=T) %>% select(WetID)
 
-
-
-
-#7.3.2 Subshed~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-#7.3.3 Subshed~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-
-giws %>% filter(spawned!=0 & is.na(merge_to)) %>% plot()
