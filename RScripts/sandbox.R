@@ -6,8 +6,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 #To-do
-#1) Make GIWS "Merge To" collumn reference a WetID
-#Create seperate merge polygong for simpler calcs
+#1) make subshed delineation based on unbreached dem [maybe?]
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #1.0 Setup workspace============================================================
@@ -131,7 +130,7 @@ giws<-giws %>%
 giws$WetID<-seq(1, nrow(giws))
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#4.0 Define merging patterns within depressions================================-
+#4.0 Define merging patterns within depressions=================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Reference to Wu et al [2019] code: 
 #https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
@@ -435,14 +434,6 @@ flowpath<-flowpath*giws_grd
 #Convert to vector
 flowpath<-flowpath %>% st_as_stars(.) %>% st_as_sf(., merge = TRUE)
 
-#5.5 Plot for funzies-----------------------------------------------------------
-plot(dem)
-streams %>% plot(., col="dodgerblue4", add=T)
-giws %>% st_geometry() %>% plot(., add=T, lty=2)
-giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
-flowpath %>% st_geometry() %>% plot(., add=T, lcol="dodgerblue1")
-seeds %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
-
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #6.0 Watershed Delineation======================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -489,8 +480,10 @@ pp<-fp %>%
   select(WetID)
 
 #6.2 Delineate subsheds---------------------------------------------------------
+#6.2.1 Subshed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Write shpaes to workspace
-st_write(pp, paste0(data_dir, "pp.shp"))
+st_write(pp, paste0(data_dir, "pp.shp"), delete_layer=T)
+writeRaster(dem_burn, paste0(data_dir, "dem.tif"), overwrite=T)
 
 #Conduct watershed analysis
 watershed(d8_pntr = paste0(data_dir, "fdr.tif"), 
@@ -501,9 +494,70 @@ watershed(d8_pntr = paste0(data_dir, "fdr.tif"),
 subsheds<-raster(paste0(data_dir,"subshed.tif"))
 
 #Convert to polygon
-subsheds<-subsheds %>% st_as_stars(.) %>% st_as_sf(., merge=T) %>% rename(WetID=subshed) 
+subsheds<-subsheds %>% st_as_stars(.) %>% st_as_sf(., merge=T) 
+
+#Add WetID to subsheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Create function to identify subhsed
+fun<-function(n,
+              subsheds,
+              pp,
+              fp){
+  
+  #Identify pour point of interest'
+  p<-pp[n,]
+  
+  #Clip flowpath to pour point neighborhood
+  flowpath_clip<-crop(fp, st_buffer(p,res(fp)[1]*5))
+  flowpath_clip<-mask(flowpath_clip, st_buffer(p,res(fp)[1]*5))
+  
+  #Extract fac value at pp
+  p_fac_value<-raster::extract(flowpath_clip, p)
+  
+  #Make raster cell at pp equal to NA
+  flowpath_clip[flowpath_clip==p_fac_value]<-NA
+  
+  #Find "upstream" cell of pourpoint
+  pp_new<-rasterToPoints(flowpath_clip) %>%
+    #Convert to tibble for processing
+    as_tibble(.) %>%
+    #Remove "downstream points"
+    filter(layer <= p_fac_value) %>%
+    #Select max point
+    filter(layer == base::max(layer)) %>%
+    #Conver to sf point
+    st_as_sf(.,coords = c("x", "y"), crs = st_crs(pp))
+  
+  #Identify overlapping subshed
+  subshed<-subsheds[pp_new,]
+  
+  #Create output of subhsed id and WetID
+  output<-tibble(
+    WetID = p$WetID, 
+    subshed = subshed$subshed
+  )
+  
+  #Export output
+  output
+}
+
+#Apply function
+outside_fun<-function(x){
+  tryCatch(fun(x, subsheds, pp, fp), 
+           error = function(e) NA)
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(pp)), FUN=outside_fun, mc.cores=detectCores())
+output<-bind_rows(output)
+tf<-Sys.time()
+tf-t0
+
+#Add WetID to subsheds
+subsheds<-left_join(subsheds, output)
 
 #6.3 Delineate watersheds-------------------------------------------------------
+#6.3.1 Watershed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Create a temporary workspace
 scratch_dir<-paste0(tempfile(),"/")
 dir.create(scratch_dir)
@@ -519,17 +573,77 @@ files<-list.files(scratch_dir)
 #Read basins and convert to polygons
 watersheds<-raster(paste0(scratch_dir,files[1])) %>% 
   st_as_stars(.) %>% st_as_sf(., merge=T) %>%
-  rename(WetID = substr(files[1],1, nchar(files[1])-4))
+  rename(ws_id = substr(files[1],1, nchar(files[1])-4))
 for(i in 2:length(files)){
   print(i)
   temp<-raster(paste0(scratch_dir,files[i])) %>% 
     st_as_stars(.) %>% st_as_sf(., merge=T) %>%
-    rename(WetID = substr(files[i],1, nchar(files[i])-4))
+    rename(ws_id = substr(files[i],1, nchar(files[i])-4))
   watersheds<-rbind(watersheds, temp)
 }
 
 #Delete temporary workspace
 unlink(scratch_dir, recursive = T)
+
+#6.3.2 Add WetID to Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Create function to identify subhsed
+fun<-function(n, 
+              watersheds,
+              pp,
+              fp){
+  
+  #Identify pour point of interest'
+  p<-pp[n,]
+  
+  #Clip flowpath to pour point neighborhood
+  flowpath_clip<-crop(fp, st_buffer(p,res(fp)[1]*5))
+  flowpath_clip<-mask(flowpath_clip, st_buffer(p,res(fp)[1]*5))
+  
+  #Extract fac value at pp
+  p_fac_value<-raster::extract(flowpath_clip, p)
+  
+  #Make raster cell at pp equal to NA
+  flowpath_clip[flowpath_clip==p_fac_value]<-NA
+  
+  #Find "upstream" cell of pourpoint
+  pp_new<-rasterToPoints(flowpath_clip) %>%
+    #Convert to tibble for processing
+    as_tibble(.) %>%
+    #Remove "downstream points"
+    filter(layer <= p_fac_value) %>%
+    #Select max point
+    filter(layer == base::max(layer)) %>%
+    #Conver to sf point
+    st_as_sf(.,coords = c("x", "y"), crs = st_crs(pp))
+  
+  #Identify overlapping watershed
+  watershed<-watersheds[pp_new,]
+  
+  #Create output of subhsed id and WetID
+  output<-tibble(
+    WetID = p$WetID, 
+    ws_id = watershed$ws_id
+  )
+  
+  #Export output
+  output
+}
+
+#Apply function
+outside_fun<-function(x){
+  tryCatch(fun(x, watersheds, pp, fp), 
+           error = function(e) NA)
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(pp)), FUN=outside_fun, mc.cores=detectCores())
+output<-bind_rows(output)
+tf<-Sys.time()
+tf-t0
+
+#Add WetID to subsheds
+watersheds<-left_join(watersheds, output)
 
 #6.4 Estimate area metrics------------------------------------------------------
 #6.4.1 Estimate subshed area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -557,15 +671,6 @@ watershed_area<-watersheds %>%
 
 #Join to GIWS tibble
 giws<-left_join(giws, watershed_area)
-
-#6.5 Plot for funzies-----------------------------------------------------------
-plot(dem)
-streams %>% plot(., col="dodgerblue4", add=T)
-giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T, lty=2, col="dodgerblue4")
-giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
-subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
-flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
-pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #7.0 Estimtate Storage Capacity=================================================
@@ -671,4 +776,15 @@ watershed<-watersheds %>% filter(WetID == giw$WetID)
 
 #Create centroid of giws
 centroids<-giws %>% st_centroid(., by_element=T) %>% select(WetID)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Plot for funzies===============================================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+plot(dem)
+streams %>% plot(., col="dodgerblue4", add=T)
+giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T, lty=2, col="dodgerblue4")
+giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
+subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
+flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
+pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
 
