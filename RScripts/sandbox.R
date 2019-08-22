@@ -22,6 +22,7 @@ library(gstat)
 library(stars)
 library(fasterize)
 library(whitebox)
+library(igraph)
 library(sf)
 library(raster)
 library(tidyverse)
@@ -86,6 +87,7 @@ dem_burn<-raster(paste0(data_dir, "II_Work/dem_burn.tif"))
 #writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
 
 #Apply stochastic depressin analysis tool
+set.seed(100)
 stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_burn.tif"), 
                                output = paste0(data_dir,"II_Work/giws.tif"), 
                                rmse = 0.18, 
@@ -299,13 +301,13 @@ fun<-function(n,
               giws,
               fac,
               fdr){
-
+  
   #Identify giw of interest 
   giw<- giws[n,]
   
   #If a leaf or branch wetland, skip!
   if(is.na(giw$merge_to)){
-  
+    
     #Create temporary workspace
     scratch_dir<-paste0(tempfile(),"/")
     dir.create(scratch_dir)
@@ -365,7 +367,7 @@ fun<-function(n,
         select(WetID, flow_to) 
     }else{
       output<-tibble(WetID = giw$WetID, 
-                      flow_to = NA)
+                     flow_to = NA)
     }
     
     #Delete temp file
@@ -373,7 +375,7 @@ fun<-function(n,
     
   }else{
     output<-tibble(WetID = giw$WetID, 
-                    flow_to = NA)
+                   flow_to = NA)
   }
   
   #Export output
@@ -453,7 +455,7 @@ trace_downslope_flowpaths(seed_pts = paste0(data_dir,"seeds.shp"),
 #Read flowpath raster into R environment
 fp<-raster(paste0(data_dir, "flowpath.tif"))*0+1
 
-#6.1.2 Define pourpoint along flowpath for each wetland~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.1.2 Define pourpoint along flowpath for non-branch wetland~~~~~~~~~~~~~~~~~~~
 #Add fac information to flowpath raster
 fp<-fac*fp
 
@@ -463,7 +465,7 @@ giws_grd<- giws %>%
   filter(is.na(merge_to) | (merge_to>0 & spawned == 0)) %>%
   #Create raster where values correspond to WetID
   fasterize(., raster = dem, field = 'WetID')
-  
+
 #Estiamte pourpoint 
 pp<-fp %>% 
   #Convert to sf points object
@@ -496,7 +498,7 @@ subsheds<-raster(paste0(data_dir,"subshed.tif"))
 #Convert to polygon
 subsheds<-subsheds %>% st_as_stars(.) %>% st_as_sf(., merge=T) 
 
-#Add WetID to subsheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#6.2.2 Add WetID to subsheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Create function to identify subhsed
 fun<-function(n,
               subsheds,
@@ -556,7 +558,249 @@ tf-t0
 #Add WetID to subsheds
 subsheds<-left_join(subsheds, output)
 
+#6.2.3 Correct "merged" subsheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#We delineated leaf and root subsheds.  The leaf subsheds were deleted from the large 
+#merged subshed, so we need to add them back in.
+
+#Create list of merged subsheds
+merge_id<- giws %>% as_tibble() %>% filter(root_giw != WetID) %>% select(root_giw) %>% unique() %>% as_vector() %>% as.numeric()
+
+#create function to merge shapes (there's likely a better way to do this with purr)
+fun<-function(n,
+              merge_id,
+              giws){
+  #Identify subhseds to merge
+  merged_subsheds<-
+    #Convert giws to tibble
+    giws %>% as_tibble() %>% 
+    #Select wetlands in merged complex
+    filter(root_giw == as.numeric(merge_id[n])) %>%
+    #Reduce tibble to just the unique id
+    select(WetID) %>%
+    #left join with subshed
+    left_join(.,subsheds) %>% 
+    #Convert to a single polygon
+    st_as_sf() %>% st_union() %>% st_sf() %>%
+    #Add required collumns
+    mutate(WetID = as.numeric(merge_id[n]), subshed = NA)
+  
+  #Export merged shape
+  merged_subsheds
+}
+
+#Create update subshed shapes (i.e., apply the damn function)
+outside_fun<-function(x){
+  tryCatch(fun(x, merge_id, giws), 
+           error = function(e) NA)
+}
+updated_subsheds<-lapply(seq(1,length(merge_id)), outside_fun)  %>% do.call(rbind, .)
+
+#Replace "bad" subsheds with updated subsheds
+subsheds<- subsheds %>% filter(!(WetID %in% merge_id)) %>% rbind(., updated_subsheds)
+
 #6.3 Delineate watersheds-------------------------------------------------------
+#Unnest subsheds using igraph approach. (Credit Goes to Kelly Hondula: https://github.com/ecodasXIII/coastalsheds/blob/master/02-get-huc12shed.Rmd#L105)
+fun<-function(n, giws, subsheds){
+  #Identify unique ID for wetland of interest (note, here we are choosing the root wetland's ID) 
+  UID<-giws$root_giw[n] 
+  
+  #Use igraph to determine upstream subsheds
+  edgelist<-giws %>% 
+    st_drop_geometry() %>% 
+    select(WetID,flow_to) %>% 
+    mutate(flow_to = if_else(is.na(flow_to), 
+                             0,
+                             flow_to))
+  
+  network<-edgelist %>% graph_from_data_frame()
+  paths_in<-all_simple_paths(network, from = UID, mode = "in")
+  upstream_subsheds<-sapply(paths_in, names) %>% unlist() %>% unique() %>% as.numeric()
+  
+  #Add focal wetlands subshed ID
+  upstream_subsheds<-c(UID, upstream_subsheds)
+  
+  #Merge watershed shape
+  watershed<-
+    #Convert giws to tibble
+    giws %>% as_tibble() %>% 
+    #Select upstream wetlands
+    filter(WetID %in% upstream_subsheds) %>%
+    #Reduce tibble to just the unique id
+    select(WetID) %>%
+    #left join with subshed
+    left_join(.,subsheds) %>% 
+    #Convert to a single polygon
+    st_as_sf() %>% st_union() %>% st_sf() %>%
+    #Add unique identifier [note, use the WetID instead of root_ID here]
+    mutate(WetID = giws$Wet[n])
+  
+  #Export watershed shape
+  watershed
+}
+
+#Apply function
+outside_fun<-function(x){
+  tryCatch(fun(x, giws, subsheds), 
+           error = function(e) NA)
+}
+
+#apply function (~ minutes on SESYNC server)
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores()) %>% do.call(rbind,.)
+
+
+#Add WetID to subsheds
+watersheds<-left_join(watersheds, output)
+
+
+#6.4 Estimate area metrics------------------------------------------------------
+#6.4.1 Estimate subshed area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+subshed_area<-subsheds %>%
+  #estimate area
+  mutate(subshed_area_m2 = st_area(., by_element=T)) %>%
+  #Get rid of units
+  mutate(subshed_area_m2 = as.numeric(subshed_area_m2)) %>%
+  #Convert to tibble
+  as_tibble(.) %>%
+  select(WetID, subshed_area_m2)
+
+#Join to GIWS tibble
+giws<-left_join(giws, subshed_area)
+
+#6.4.2 Estimate watershed area area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+watershed_area<-watersheds %>%
+  #estimate area
+  mutate(watershed_area_m2 = st_area(., by_element=T)) %>%
+  #Get rid of units
+  mutate(watershed_area_m2 = as.numeric(watershed_area_m2)) %>%
+  #Convert to tibble
+  as_tibble(.) %>%
+  select(WetID, watershed_area_m2)
+
+#Join to GIWS tibble
+giws<-left_join(giws, watershed_area)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#7.0 Estimtate Storage Capacity [Volume]========================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#7.1 Create function to estimate storage capacity-------------------------------
+fun<-function(n, 
+              giws, 
+              dem){
+  
+  #Identify giw of interest
+  giw<-giws[n,]
+  
+  #Convert to raster
+  dem_giw<-crop(dem, giw)
+  dem_giw<-mask(dem_giw, giw)
+  
+  #Create max raster
+  max_giw<-dem_giw*0+cellStats(dem_giw, base::max)
+  
+  #Estimate volume between max_giw and dem_giw rasters
+  depth_giw<-max_giw - dem_giw
+  volume_m3<-cellStats(depth_giw, base::sum)*res(depth_giw)[1]*res(depth_giw)[2]
+  
+  #Export output
+  tibble(WetID = giw$WetID, 
+         volume_m3)
+}
+
+
+#7.2 Execute function-----------------------------------------------------------
+outside_fun<-function(x){
+  tryCatch(fun(x, giws, dem), 
+           error = function(e) NA)
+}
+
+#apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+output<-do.call(rbind, output)
+tf<-Sys.time()
+tf-t0
+
+#Merge output with giws tibble
+giws<-left_join(giws, output)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#8.0 HSC Metrics================================================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#8.1 Individual Wetlands--------------------------------------------------------
+#Estimate hsc for "leaf" wetlands
+output<-giws %>% as_tibble() %>% 
+  #Select lowest subunit of wetland (i.e.,a leaf)
+  filter(spawned==0) %>%
+  #Estimate Storage Capacity
+  mutate(wetland_hsc_cm = volume_m3/subshed_area_m2*100) %>%
+  #Select collumns for output
+  select(WetID, wetland_hsc_cm)
+
+#Join to GIWs tibble
+giws<-left_join(giws, output)
+
+#8.2 Root/Merged Wetlands-------------------------------------------------------
+#Estimate hsc for merged wetlands [only max merge]
+output<-giws %>% as_tibble() %>% 
+  #Select lowest subunit of wetland (i.e.,a leaf)
+  filter(spawned!=0 & WetID==root_giw) %>%
+  #Estimate Storage Capacity
+  mutate(merged_hsc_cm = volume_m3/subshed_area_m2*100) %>%
+  #Select collumns for output
+  select(WetID, merged_hsc_cm)
+
+#Join to GIWs tibble
+giws<-left_join(giws, output)
+
+#7.3.3 Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Use a spatial join function for now [graduate to network analysis later?]
+
+#Creat function to find wetlands within a given wateshed
+#fun<-function(n, giws, watersheds)
+
+#Select of interest 
+giw<-giws %>% slice(n)
+
+#Define its WetID [for later use]
+WetID<-giw$WetID
+
+#Identify root wetland
+#Is this a root wetlands?
+if(giw$WetID != giw$root_giw){
+  #If not, redefine giw as its root wetland
+  giw<-giws %>% filter(WetID == giw$root_giw)
+}
+
+#Identify watershed
+watershed<-watersheds %>% filter(WetID == giw$WetID)
+
+#Welp...that's a good place to quit.  My watershed IDs and WetIDs are a mis-match. Soo..
+#  tomorrow: (1) Fix that shit, 
+#            (2) Identify all wetlands withint watershed by their centroids
+#            (3) Sum everything up adn divide by the ws_area!
+#            (4) Remember, when you spit it out, use WetID defined above as ID...
+#  then, calculate vertical metrics and send to Anna.
+
+#Identify matching watershed
+
+#Create centroid of giws
+centroids<-giws %>% st_centroid(., by_element=T) %>% select(WetID)
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Plot for funzies===============================================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+plot(dem)
+streams %>% plot(., col="dodgerblue4", add=T)
+giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T, lty=2, col="dodgerblue4")
+giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
+subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
+flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
+pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Code Graveyard=================================================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #6.3.1 Watershed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Create a temporary workspace
 scratch_dir<-paste0(tempfile(),"/")
@@ -644,147 +888,4 @@ tf-t0
 
 #Add WetID to subsheds
 watersheds<-left_join(watersheds, output)
-
-#6.4 Estimate area metrics------------------------------------------------------
-#6.4.1 Estimate subshed area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-subshed_area<-subsheds %>%
-  #estimate area
-  mutate(subshed_area_m2 = st_area(., by_element=T)) %>%
-  #Get rid of units
-  mutate(subshed_area_m2 = as.numeric(subshed_area_m2)) %>%
-  #Convert to tibble
-  as_tibble(.) %>%
-  select(WetID, subshed_area_m2)
-
-#Join to GIWS tibble
-giws<-left_join(giws, subshed_area)
-
-#6.4.2 Estimate watershed area area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-watershed_area<-watersheds %>%
-  #estimate area
-  mutate(watershed_area_m2 = st_area(., by_element=T)) %>%
-  #Get rid of units
-  mutate(watershed_area_m2 = as.numeric(watershed_area_m2)) %>%
-  #Convert to tibble
-  as_tibble(.) %>%
-  select(WetID, watershed_area_m2)
-
-#Join to GIWS tibble
-giws<-left_join(giws, watershed_area)
-
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#7.0 Estimtate Storage Capacity=================================================
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#7.1 Create function to estimate storage capacity-------------------------------
-fun<-function(n, 
-              giws, 
-              dem){
-
-  #Identify giw of interest
-  giw<-giws[n,]
-  
-  #Convert to raster
-  dem_giw<-crop(dem, giw)
-  dem_giw<-mask(dem_giw, giw)
-  
-  #Create max raster
-  max_giw<-dem_giw*0+cellStats(dem_giw, base::max)
-  
-  #Estimate volume between max_giw and dem_giw rasters
-  depth_giw<-max_giw - dem_giw
-  volume_m3<-cellStats(depth_giw, base::sum)*res(depth_giw)[1]*res(depth_giw)[2]
-  
-  #Export output
-  tibble(WetID = giw$WetID, 
-         volume_m3)
-}
-
-
-#7.2 Execute function-----------------------------------------------------------
-outside_fun<-function(x){
-  tryCatch(fun(x, giws, dem), 
-           error = function(e) NA)
-}
-
-#apply function (~ minutes on SESYNC server)
-t0<-Sys.time()
-output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
-output<-do.call(rbind, output)
-tf<-Sys.time()
-tf-t0
-
-#Merge output with giws tibble
-giws<-left_join(giws, output)
-
-#7.3 Estimate aggregegate storage capacity metrics------------------------------
-#7.3.2 Individual Wetlands~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Estimate hsc for "leaf" wetlands
-output<-giws %>% as_tibble() %>% 
-  #Select lowest subunit of wetland (i.e.,a leaf)
-  filter(spawned==0) %>%
-  #Estimate Storage Capacity
-  mutate(wetland_hsc_cm = volume_m3/subshed_area_m2*100) %>%
-  #Select collumns for output
-  select(WetID, wetland_hsc_cm)
-
-#Join to GIWs tibble
-giws<-left_join(giws, output)
-
-#7.3.2 Merged Wetlands~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Estimate hsc for merged wetlands [only max merge]
-output<-giws %>% as_tibble() %>% 
-  #Select lowest subunit of wetland (i.e.,a leaf)
-  filter(spawned!=0 & WetID==root_giw) %>%
-  #Estimate Storage Capacity
-  mutate(merged_hsc_cm = volume_m3/subshed_area_m2*100) %>%
-  #Select collumns for output
-  select(WetID, merged_hsc_cm)
-
-#Join to GIWs tibble
-giws<-left_join(giws, output)
-
-#7.3.3 Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Use a spatial join function for now [graduate to network analysis later?]
-
-#Creat function to find wetlands within a given wateshed
-#fun<-function(n, giws, watersheds)
-
-#Select of interest 
-giw<-giws %>% slice(n)
-
-#Define its WetID [for later use]
-WetID<-giw$WetID
-
-#Identify root wetland
-#Is this a root wetlands?
-if(giw$WetID != giw$root_giw){
-  #If not, redefine giw as its root wetland
-  giw<-giws %>% filter(WetID == giw$root_giw)
-}
-
-#Identify watershed
-watershed<-watersheds %>% filter(WetID == giw$WetID)
-
-#Welp...that's a good place to quit.  My watershed IDs and WetIDs are a mis-match. Soo..
-#  tomorrow: (1) Fix that shit, 
-#            (2) Identify all wetlands withint watershed by their centroids
-#            (3) Sum everything up adn divide by the ws_area!
-#            (4) Remember, when you spit it out, use WetID defined above as ID...
-#  then, calculate vertical metrics and send to Anna.
-
-#Identify matching watershed
-
-#Create centroid of giws
-centroids<-giws %>% st_centroid(., by_element=T) %>% select(WetID)
-
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Plot for funzies===============================================================
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-plot(dem)
-streams %>% plot(., col="dodgerblue4", add=T)
-giws %>% filter(is.na(merge_to)) %>% st_geometry() %>% plot(., add=T, lty=2, col="dodgerblue4")
-giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
-subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
-flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
-pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
 
