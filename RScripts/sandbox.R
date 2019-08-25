@@ -5,9 +5,6 @@
 #Purpose: Examine 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-#To-do
-#1) make subshed delineation based on unbreached dem [maybe?]
-
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #1.0 Setup workspace============================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -346,7 +343,7 @@ fun<-function(n,
     giws_ds<-giws[flowpath_shp,] %>% filter(is.na(merge_to)) %>% filter(WetID != giw$WetID)
     
     #Convert to points
-    giw_bndry<- giws_ds %>% select(WetID) %>% st_cast(., "POINT")
+    giw_bndry<- giws_ds %>% select(WetID) %>% st_segmentize(.,1) %>% st_cast(., "POINT")
     
     #Estimate flow accumulation along flowpath
     fac_fp<-flowpath_grd*fac
@@ -604,16 +601,16 @@ fun<-function(n, giws, subsheds){
   #Identify unique ID for wetland of interest (note, here we are choosing the root wetland's ID) 
   UID<-giws$root_giw[n] 
   
-  #Use igraph to determine upstream subsheds
+  #Create edgelist
   edgelist<-giws %>% 
     st_drop_geometry() %>% 
-    select(WetID,flow_to) %>% 
-    mutate(flow_to = if_else(is.na(flow_to), 
-                             0,
-                             flow_to))
+    select(WetID,flow_to) 
   
+  #Crate network object from edgelist
   network<-edgelist %>% graph_from_data_frame()
-  paths_in<-all_simple_paths(network, from = UID, mode = "in")
+  
+  #define upstream paths 
+  paths_in<-all_simple_paths(network, from = paste(UID), mode = "in")
   upstream_subsheds<-sapply(paths_in, names) %>% unlist() %>% unique() %>% as.numeric()
   
   #Add focal wetlands subshed ID
@@ -645,12 +642,7 @@ outside_fun<-function(x){
 }
 
 #apply function (~ minutes on SESYNC server)
-output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores()) %>% do.call(rbind,.)
-
-
-#Add WetID to subsheds
-watersheds<-left_join(watersheds, output)
-
+watersheds<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores()) %>% do.call(rbind,.)
 
 #6.4 Estimate area metrics------------------------------------------------------
 #6.4.1 Estimate subshed area~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -752,39 +744,123 @@ output<-giws %>% as_tibble() %>%
 #Join to GIWs tibble
 giws<-left_join(giws, output)
 
-#7.3.3 Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Use a spatial join function for now [graduate to network analysis later?]
-
+#8.3 Watersheds-----------------------------------------------------------------
 #Creat function to find wetlands within a given wateshed
-#fun<-function(n, giws, watersheds)
+fun<-function(n, giws){
 
-#Select of interest 
-giw<-giws %>% slice(n)
-
-#Define its WetID [for later use]
-WetID<-giw$WetID
-
-#Identify root wetland
-#Is this a root wetlands?
-if(giw$WetID != giw$root_giw){
-  #If not, redefine giw as its root wetland
-  giw<-giws %>% filter(WetID == giw$root_giw)
+  #Select of interest 
+  giw<-giws %>% slice(n)
+  
+  #Define its WetID [for later use]
+  WetID<-giw$WetID
+  
+  #Identify root wetland
+  #Is this a root wetlands?
+  if(giw$WetID != giw$root_giw){
+    #If not, redefine giw as its root wetland
+    giw<-giws %>% filter(WetID == giw$root_giw)
+  }
+  
+  #Identify upstream giws
+  edgelist<-giws %>% 
+    st_drop_geometry() %>% 
+    select(WetID,flow_to) 
+  network<-edgelist %>% graph_from_data_frame()
+  paths_in<-all_simple_paths(network, from = paste(giw$WetID), mode = "in")
+  upstream_giws<-sapply(paths_in, names) %>% unlist() %>% unique() %>% as.numeric()
+  
+  #add current giw to upstream giws tibble
+  upstream_giws<-c(giw$WetID, upstream_giws)
+  
+  #Estiamte storage capacity in watershed
+  watershed_hsc_cm<-giws %>%
+    #Drop spatial attributes 
+    st_drop_geometry() %>% 
+    #filter to upstream giws
+    filter(WetID %in% upstream_giws) %>% 
+    #select volume
+    select(volume_m3, watershed_area_m2) %>% 
+    #sum
+    summarise(watershed_hsc_cm = sum(volume_m3, na.rm=T)/giw$watershed_area_m2)*100
+  
+  #Create Output
+  output<-tibble(WetID, 
+                 watershed_hsc_cm= watershed_hsc_cm$watershed_hsc_cm)
+  output
 }
 
-#Identify watershed
-watershed<-watersheds %>% filter(WetID == giw$WetID)
+#apply function
+output<-lapply(seq(1,nrow(giws)), fun, giws=giws) %>% bind_rows()
 
-#Welp...that's a good place to quit.  My watershed IDs and WetIDs are a mis-match. Soo..
-#  tomorrow: (1) Fix that shit, 
-#            (2) Identify all wetlands withint watershed by their centroids
-#            (3) Sum everything up adn divide by the ws_area!
-#            (4) Remember, when you spit it out, use WetID defined above as ID...
-#  then, calculate vertical metrics and send to Anna.
+#Join to GIWs tibble
+giws<-left_join(giws, output)
 
-#Identify matching watershed
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#9.0 Estimate HAND Metrics======================================================
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# 9.1 Prep Stream Layer -------------------------------------------------------
+#[F]asterize stream layer
+stream_grd<-fasterize(streams, dem)
 
-#Create centroid of giws
-centroids<-giws %>% st_centroid(., by_element=T) %>% select(WetID)
+#Create XYZ tibble of stream info
+stream_ele<-stream_grd*dem
+stream_ele<-rasterToPoints(stream_ele) 
+stream_ele<-as_tibble(stream_ele)
+
+#create blank raster for interpollation
+jig<-dem*0
+
+#Interpolate
+stream_idw<-gstat(id="layer", 
+                  formula=layer~1, 
+                  locations=~x+y, 
+                  data=stream_ele, 
+                  nmax=7, 
+                  set=list(idp=4.2))
+stream_idw<-interpolate(jig, stream_idw)
+crs(stream_idw)<-p
+
+#8.2 Create function to estimate hand-------------------------------------------
+fun<-function(n,
+              giws,
+              stream_idw,
+              dem){
+  
+  #isolate giw in question
+  giw<-giws[n,]
+  
+  #Crop DEM raster to GIW polygong
+  dem_temp<-crop(dem, giw)
+  dem_temp<-mask(dem_temp, giw)
+  
+  #crop stream_idw raster to giw
+  stream_temp<-crop(stream_idw, giw)
+  stream_temp<-mask(stream_temp, giw)
+   
+  #estimate hand
+  hand_min<-cellStats(dem_temp, base::min) - cellStats(stream_temp, base::mean)
+  hand_mean<-cellStats(dem_temp, base::mean) - cellStats(stream_temp, base::mean)
+  
+  #Export HAND estimate 
+  tibble(WetID = giw$WetID, 
+         hand_min_m = hand_min, 
+         hand_mean_m = hand_mean)
+}
+
+#8.3 Execute function-----------------------------------------------------------
+#Create wrapper function w/ tryCatch for error handling
+outside_fun<-function(x){
+  tryCatch(fun(x, giws=giws, stream_idw = stream_idw, dem=dem), 
+           error = function(e) tibble(WetID = giws$WetID[n],
+                                      hand_m = NA))
+}
+
+#apply function (~ minutes on SESYNC server)
+output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
+output<-bind_rows(output)
+
+#Join to GIWs
+giws<-left_join(giws, output)
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Plot for funzies===============================================================
@@ -801,91 +877,91 @@ pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Code Graveyard=================================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#6.3.1 Watershed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Create a temporary workspace
-scratch_dir<-paste0(tempfile(),"/")
-dir.create(scratch_dir)
-
-#Run WBT unnested watershed delineation tool
-unnest_basins(d8_pntr = paste0(data_dir, "fdr.tif"), 
-              pour_pts = paste0(data_dir,"pp.shp"), 
-              output = paste0(scratch_dir,"watershed.tif"))
-
-#Create list of raster files
-files<-list.files(scratch_dir)
-
-#Read basins and convert to polygons
-watersheds<-raster(paste0(scratch_dir,files[1])) %>% 
-  st_as_stars(.) %>% st_as_sf(., merge=T) %>%
-  rename(ws_id = substr(files[1],1, nchar(files[1])-4))
-for(i in 2:length(files)){
-  print(i)
-  temp<-raster(paste0(scratch_dir,files[i])) %>% 
-    st_as_stars(.) %>% st_as_sf(., merge=T) %>%
-    rename(ws_id = substr(files[i],1, nchar(files[i])-4))
-  watersheds<-rbind(watersheds, temp)
-}
-
-#Delete temporary workspace
-unlink(scratch_dir, recursive = T)
-
-#6.3.2 Add WetID to Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Create function to identify subhsed
-fun<-function(n, 
-              watersheds,
-              pp,
-              fp){
-  
-  #Identify pour point of interest'
-  p<-pp[n,]
-  
-  #Clip flowpath to pour point neighborhood
-  flowpath_clip<-crop(fp, st_buffer(p,res(fp)[1]*5))
-  flowpath_clip<-mask(flowpath_clip, st_buffer(p,res(fp)[1]*5))
-  
-  #Extract fac value at pp
-  p_fac_value<-raster::extract(flowpath_clip, p)
-  
-  #Make raster cell at pp equal to NA
-  flowpath_clip[flowpath_clip==p_fac_value]<-NA
-  
-  #Find "upstream" cell of pourpoint
-  pp_new<-rasterToPoints(flowpath_clip) %>%
-    #Convert to tibble for processing
-    as_tibble(.) %>%
-    #Remove "downstream points"
-    filter(layer <= p_fac_value) %>%
-    #Select max point
-    filter(layer == base::max(layer)) %>%
-    #Conver to sf point
-    st_as_sf(.,coords = c("x", "y"), crs = st_crs(pp))
-  
-  #Identify overlapping watershed
-  watershed<-watersheds[pp_new,]
-  
-  #Create output of subhsed id and WetID
-  output<-tibble(
-    WetID = p$WetID, 
-    ws_id = watershed$ws_id
-  )
-  
-  #Export output
-  output
-}
-
-#Apply function
-outside_fun<-function(x){
-  tryCatch(fun(x, watersheds, pp, fp), 
-           error = function(e) NA)
-}
-
-#apply function (~ minutes on SESYNC server)
-t0<-Sys.time()
-output<-mclapply(X=seq(1,nrow(pp)), FUN=outside_fun, mc.cores=detectCores())
-output<-bind_rows(output)
-tf<-Sys.time()
-tf-t0
-
-#Add WetID to subsheds
-watersheds<-left_join(watersheds, output)
-
+# #6.3.1 Watershed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# #Create a temporary workspace
+# scratch_dir<-paste0(tempfile(),"/")
+# dir.create(scratch_dir)
+# 
+# #Run WBT unnested watershed delineation tool
+# unnest_basins(d8_pntr = paste0(data_dir, "fdr.tif"), 
+#               pour_pts = paste0(data_dir,"pp.shp"), 
+#               output = paste0(scratch_dir,"watershed.tif"))
+# 
+# #Create list of raster files
+# files<-list.files(scratch_dir)
+# 
+# #Read basins and convert to polygons
+# watersheds<-raster(paste0(scratch_dir,files[1])) %>% 
+#   st_as_stars(.) %>% st_as_sf(., merge=T) %>%
+#   rename(ws_id = substr(files[1],1, nchar(files[1])-4))
+# for(i in 2:length(files)){
+#   print(i)
+#   temp<-raster(paste0(scratch_dir,files[i])) %>% 
+#     st_as_stars(.) %>% st_as_sf(., merge=T) %>%
+#     rename(ws_id = substr(files[i],1, nchar(files[i])-4))
+#   watersheds<-rbind(watersheds, temp)
+# }
+# 
+# #Delete temporary workspace
+# unlink(scratch_dir, recursive = T)
+# 
+# #6.3.2 Add WetID to Watersheds~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# #Create function to identify subhsed
+# fun<-function(n, 
+#               watersheds,
+#               pp,
+#               fp){
+#   
+#   #Identify pour point of interest'
+#   p<-pp[n,]
+#   
+#   #Clip flowpath to pour point neighborhood
+#   flowpath_clip<-crop(fp, st_buffer(p,res(fp)[1]*5))
+#   flowpath_clip<-mask(flowpath_clip, st_buffer(p,res(fp)[1]*5))
+#   
+#   #Extract fac value at pp
+#   p_fac_value<-raster::extract(flowpath_clip, p)
+#   
+#   #Make raster cell at pp equal to NA
+#   flowpath_clip[flowpath_clip==p_fac_value]<-NA
+#   
+#   #Find "upstream" cell of pourpoint
+#   pp_new<-rasterToPoints(flowpath_clip) %>%
+#     #Convert to tibble for processing
+#     as_tibble(.) %>%
+#     #Remove "downstream points"
+#     filter(layer <= p_fac_value) %>%
+#     #Select max point
+#     filter(layer == base::max(layer)) %>%
+#     #Conver to sf point
+#     st_as_sf(.,coords = c("x", "y"), crs = st_crs(pp))
+#   
+#   #Identify overlapping watershed
+#   watershed<-watersheds[pp_new,]
+#   
+#   #Create output of subhsed id and WetID
+#   output<-tibble(
+#     WetID = p$WetID, 
+#     ws_id = watershed$ws_id
+#   )
+#   
+#   #Export output
+#   output
+# }
+# 
+# #Apply function
+# outside_fun<-function(x){
+#   tryCatch(fun(x, watersheds, pp, fp), 
+#            error = function(e) NA)
+# }
+# 
+# #apply function (~ minutes on SESYNC server)
+# t0<-Sys.time()
+# output<-mclapply(X=seq(1,nrow(pp)), FUN=outside_fun, mc.cores=detectCores())
+# output<-bind_rows(output)
+# tf<-Sys.time()
+# tf-t0
+# 
+# #Add WetID to subsheds
+# watersheds<-left_join(watersheds, output)
+# 
