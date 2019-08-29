@@ -653,7 +653,13 @@ watershed_area<-watersheds %>%
   select(WetID, watershed_area_m2)
 
 #Join to GIWS tibble
-giws<-left_join(giws, watershed_area)
+giws<-left_join(giws, watershed_area) 
+
+#Filter out "slivers"
+giws<-giws %>% 
+  group_by(WetID) %>% 
+  filter(subshed_area_m2 == base::max(subshed_area_m2)) %>% 
+  ungroup(.)
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #7.0 Estimtate Storage Capacity [Volume]========================================
@@ -686,7 +692,9 @@ fun<-function(n,
 #7.2 Execute function-----------------------------------------------------------
 outside_fun<-function(x){
   tryCatch(fun(x, giws, dem), 
-           error = function(e) NA)
+           error = function(e) tibble(WetID=giws$WetID[n], 
+                                      volume_m3=NA)
+           )
 }
 
 #apply function (~ minutes on SESYNC server)
@@ -733,7 +741,7 @@ giws<-left_join(giws, output)
 fun<-function(n, giws){
   
   #Select of interest 
-  giw<-giws %>% slice(n)
+  giw<-giws[n,]
   
   #Define its WetID [for later use]
   WetID<-giw$WetID
@@ -765,7 +773,7 @@ fun<-function(n, giws){
     #select volume
     select(volume_m3, watershed_area_m2) %>% 
     #sum
-    summarise(watershed_hsc_cm = sum(volume_m3, na.rm=T)/giw$watershed_area_m2)*100
+    summarise(watershed_hsc_cm = sum(volume_m3, na.rm=T)/giw$watershed_area_m2)*100 
   
   #Create Output
   output<-tibble(WetID, 
@@ -782,7 +790,7 @@ outside_fun<-function(x){
 
 #apply function 
 output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
-output<-bind_rows(output) %>% unique()
+output<-bind_rows(output) %>% distinct(.)
 
 #Join to GIWs tibble
 giws<-left_join(giws, output)
@@ -984,8 +992,11 @@ outside_fun<-function(x){
 }
 
 #apply function (~ minutes on SESYNC server)
+t0<-Sys.time()
 output<-mclapply(X=seq(1,nrow(giws)), FUN=outside_fun, mc.cores=detectCores())
 output<-bind_rows(output)
+tf<-Sys.time()
+tf-t0
 
 #Join to GIWs
 giws<-left_join(giws, output)
