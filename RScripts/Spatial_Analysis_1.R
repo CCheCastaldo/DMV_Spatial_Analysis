@@ -1,15 +1,9 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Title: Sandbox
+#Title: Spatial Analysis
 #Coder: C. Nathan Jones (cnjones7@ua.edu)
 #Date: 8/14/2019
-#Purpose: Examine 
+#Purpose: Examine hydrogeomorphic features accross Delmarva Bay wetland sites
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-#Things to do: 
-# (1) USE WBT for interpolation method [just figure that shit out]
-# (2) Send scripts to SLURM Server
-# (3) Create leaflet map
-
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #1.0 Setup workspace============================================================
@@ -35,8 +29,8 @@ library(parallel)
 p<-"+proj=utm +zone=17 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"
 
 #Download relevant data 
-#dem<-raster(paste0(data_dir,"I_Data/2007_1m_DEM.tif"))
-dem<-raster(paste0(data_dir,"I_Data/dem_jr"))
+dem<-raster(paste0(data_dir,"I_Data/2007_1m_DEM.tif"))
+#dem<-raster(paste0(data_dir,"I_Data/dem_jr"))
 dem[dem<0]<-NA
 dem<-projectRaster(dem, crs=p)  
 streams<-st_read(paste0(data_dir, "I_Data/TotalStreamNetwork_UCRW.shp"))
@@ -65,7 +59,7 @@ crs(dem_filter)<-p
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.1 Use the Stochastic Deprresion Tool to identify deprresions-----------------
 #Export fitlered DEM to workspace
-#writeRaster(dem_filter, paste0(data_dir,"II_Work/dem_filter.tif"), overwrite=T)
+writeRaster(dem_filter, paste0(data_dir,"II_Work/dem_filter.tif"), overwrite=T)
 
 #Apply stochastic depressin analysis tool
 set.seed(100)
@@ -259,23 +253,23 @@ giws<-giws %>%
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #5.1 Create flow accumulation and flow direction rasters------------------------
 #Export raster to workspace
-writeRaster(dem_filter, paste0(data_dir, "dem.tif"), overwrite=T)
+writeRaster(dem_filter, paste0(data_dir, "II_Work/dem.tif"), overwrite=T)
 
 #Execute breach tool
-breach_depressions(dem = paste0(data_dir,"dem.tif"), 
-                   output = paste0(data_dir,"dem_breach.tif"), 
+breach_depressions(dem = paste0(data_dir,"II_Work/dem.tif"), 
+                   output = paste0(data_dir,"II_Work/dem_breach.tif"), 
                    fill_pits = TRUE)
 
 #Execute WBT flow accumulation raster
-d8_flow_accumulation(dem = paste0(data_dir,"dem_breach.tif"), 
-                     output = paste0(data_dir,"fac.tif"))
+d8_flow_accumulation(dem = paste0(data_dir,"II_Work/dem_breach.tif"), 
+                     output = paste0(data_dir,"II_Work/fac.tif"))
 
-d8_pointer(dem = paste0(data_dir, "dem_breach.tif"), 
-           output = paste0(data_dir, "fdr.tif"))
+d8_pointer(dem = paste0(data_dir, "II_Work/dem_breach.tif"), 
+           output = paste0(data_dir, "II_Work/fdr.tif"))
 
 #Pull fac back into R environment
-fac<-raster(paste0(data_dir, "fac.tif"))
-fdr<-raster(paste0(data_dir, "fdr.tif"))
+fac<-raster(paste0(data_dir, "II_Work/fac.tif"))
+fdr<-raster(paste0(data_dir, "II_Work/fdr.tif"))
 
 #5.2 Create functin to identify "down gradient" wetland-------------------------
 fun<-function(n,
@@ -327,7 +321,7 @@ fun<-function(n,
     giws_ds<-giws[flowpath_shp,] %>% filter(is.na(merge_to)) %>% filter(WetID != giw$WetID)
     
     #Convert to points
-    giw_bndry<- giws_ds %>% select(WetID) %>% st_segmentize(.,1) %>% st_cast(., "POINT")
+    giw_bndry<- giws_ds %>% select(WetID) %>% st_segmentize(.,1) %>% st_cast(., "MULTILINESTRING") %>% st_cast(.,"MULTIPOINT") %>% st_cast(.,"POINT")
     
     #Estimate flow accumulation along flowpath
     fac_fp<-flowpath_grd*fac
@@ -395,15 +389,15 @@ seeds<- giws %>%
   filter(fac == base::max(fac, na.rm=T))
 
 #write seeds to workspace
-st_write(seeds, paste0(data_dir, "seeds.shp"), delete_layer = TRUE)
+st_write(seeds, paste0(data_dir, "II_Work/seeds.shp"), delete_layer = TRUE)
 
 #Execute WBT flowpaths function
-trace_downslope_flowpaths(seed_pts = paste0(data_dir,"seeds.shp"), 
-                          d8_pntr  = paste0(data_dir, "fdr.tif"), 
-                          output   = paste0(data_dir, "flowpath.tif"))
+trace_downslope_flowpaths(seed_pts = paste0(data_dir,"II_Work/seeds.shp"), 
+                          d8_pntr  = paste0(data_dir, "II_Work/fdr.tif"), 
+                          output   = paste0(data_dir, "II_Work/flowpath.tif"))
 
 #Read flowpath raster into R environment
-flowpath<-raster(paste0(data_dir, "flowpath.tif"))
+flowpath<-raster(paste0(data_dir, "II_Work/flowpath.tif"))
 
 #Convert to bianary raster
 flowpath<-flowpath*0+1
@@ -426,15 +420,15 @@ flowpath<-flowpath %>% st_as_stars(.) %>% st_as_sf(., merge = TRUE)
 seeds<- giws %>% st_cast(., "POINT") 
 
 #write seeds to workspace
-st_write(seeds, paste0(data_dir, "seeds.shp"), delete_layer = TRUE)
+st_write(seeds, paste0(data_dir, "II_Work/seeds.shp"), delete_layer = TRUE)
 
 #Execute WBT flowpaths function
-trace_downslope_flowpaths(seed_pts = paste0(data_dir,"seeds.shp"), 
-                          d8_pntr  = paste0(data_dir, "fdr.tif"), 
-                          output   = paste0(data_dir, "flowpath.tif"))
+trace_downslope_flowpaths(seed_pts = paste0(data_dir,"II_Work/seeds.shp"), 
+                          d8_pntr  = paste0(data_dir, "II_Work/fdr.tif"), 
+                          output   = paste0(data_dir, "II_Work/flowpath.tif"))
 
 #Read flowpath raster into R environment
-fp<-raster(paste0(data_dir, "flowpath.tif"))*0+1
+fp<-raster(paste0(data_dir, "II_Work/flowpath.tif"))*0+1
 
 #6.1.2 Define pourpoint along flowpath for non-branch wetland~~~~~~~~~~~~~~~~~~~
 #Add fac information to flowpath raster
@@ -465,16 +459,16 @@ pp<-fp %>%
 #6.2 Delineate subsheds---------------------------------------------------------
 #6.2.1 Subshed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Write shpaes to workspace
-st_write(pp, paste0(data_dir, "pp.shp"), delete_layer=T)
-writeRaster(dem_filter, paste0(data_dir, "dem.tif"), overwrite=T)
+st_write(pp, paste0(data_dir, "II_Work/pp.shp"), delete_layer=T)
+writeRaster(dem_filter, paste0(data_dir, "II_Work/dem.tif"), overwrite=T)
 
 #Conduct watershed analysis
-watershed(d8_pntr = paste0(data_dir, "fdr.tif"), 
-          pour_pts = paste0(data_dir,"pp.shp"), 
-          output = paste0(data_dir,"subshed.tif"))
+watershed(d8_pntr = paste0(data_dir, "II_Work/fdr.tif"), 
+          pour_pts = paste0(data_dir,"II_Work/pp.shp"), 
+          output = paste0(data_dir,"II_Work/subshed.tif"))
 
 #Read subsheds into R environment
-subsheds<-raster(paste0(data_dir,"subshed.tif"))
+subsheds<-raster(paste0(data_dir,"II_Work/subshed.tif"))
 
 #Convert to polygon
 subsheds<-subsheds %>% st_as_stars(.) %>% st_as_sf(., merge=T) 
@@ -694,7 +688,7 @@ outside_fun<-function(x){
   tryCatch(fun(x, giws, dem), 
            error = function(e) tibble(WetID=giws$WetID[n], 
                                       volume_m3=NA)
-           )
+  )
 }
 
 #apply function (~ minutes on SESYNC server)
@@ -930,63 +924,45 @@ output<-mclapply(X=seq(1, nrow(giws)),
 giws<-left_join(giws, output)
 
 #11.2 Create function to estimate HANS------------------------------------------
-fun<-function(n, giws, dem){
+fun<-function(n, giws){
   
   #Isolate wetland of interest
-  giw<-giws[n,]
+  giw<-giws[n,] %>% st_centroid(.)
   
-  #Creat mask with 1km buffer
-  giw_mask<-st_buffer(giw, 1000) 
+  #Creat mask with 1km^2 area 
+  mask<-giw %>% st_buffer(., 564.1896) 
   
-  #Isolate giws within buffer area
-  giws_buffer<-giws[giw_mask,]
+  #Select giws of interest
+  giws_masked<-giws[mask,] %>% st_centroid(.) %>% filter(WetID!=giw$WetID)
   
-  #remove giw of interest
-  giws_buffer<-giws_buffer %>% filter(WetID != giw$WetID)
+  #Estimate distance between giws
+  giws_masked$dist_m <- as.numeric(st_distance(giw, giws_masked, by_element = T))
   
-  #Create raster of giws_buffer
-  giws_mask<-fasterize(giws_buffer, dem, field = 'mean_elevation_m')
+  #Estimate weighted average wetland depth
+  hans<-giws_masked %>% 
+    #drop_geo
+    st_drop_geometry(.) %>% 
+    #Estimate inverse distance and elevation:distance ratio
+    mutate(ele_dis = mean_elevation_m/dist_m, 
+           inv_dis = 1/dist_m) %>% 
+    #Sumarise IDW
+    summarise(hans_m = giw$mean_elevation_m - sum(ele_dis)/sum(inv_dis))
+    
+  #Create output
+  output<-tibble(
+    WetID = giw$WetID,
+    hans_m = hans$hans_m
+  )
   
-  #Create interpolation of giw elevation
-  #Create XYZ tibble of stream info
-  giws_ele<-giws_mask
-  giws_ele<-rasterToPoints(giws_ele) 
-  giws_ele<-as_tibble(giws_ele)
-  
-  #create blank raster for interpollation
-  giw_mask<-fasterize(giw_mask, dem)*0
-  
-  #Create Interpolation raster
-  giws_idw<-gstat(id="layer", 
-                  formula=layer~1, 
-                  locations=~x+y, 
-                  data=giws_ele, 
-                  nmax=7, 
-                  set=list(idp=4.2))
-  giws_idw<-interpolate(giw_mask, giws_idw)
-  crs(giws_idw)<-p
-  
-  #Crop DEM and interporated raster to giw
-  giw_dem<-crop(dem, giw)
-  giw_dem<-mask(giw_dem, giw)
-  giw_idw<-crop(giws_idw, giw)
-  giw_idw<-mask(giw_idw, giw)
-  
-  #Estimate HANs metric
-  hans<-cellStats(giw_dem, mean) - cellStats(giw_idw, mean)
-  
-  #create output
-  output<-tibble(WetID = giw$WetID,
-                 hans_m = hans)
-  
-  #Output
+  #Return output
   output
+
 }
 
 #11.3 Execute function to estimate HANS-----------------------------------------
 #Create wrapper function w/ tryCatch for error handling
 outside_fun<-function(x){
-  tryCatch(fun(x, giws=giws, dem=dem), 
+  tryCatch(fun(x, giws=giws), 
            error = function(e) tibble(WetID = giws$WetID[n],
                                       hans_m = NA))
 }
@@ -1026,7 +1002,12 @@ fun<-function(n){
   
   #Estiamte longest length
   wet_order<-sapply(paths, length)
-  wet_order<-ifelse(length(wet_order)==0, 1, base::max(wet_order, na.rm=T))
+  if(length(wet_order)!=0){
+    wet_order<-base::max(wet_order, na.rm=T)
+    wet_order<-ifelse(wet_order==1, 2, wet_order)
+  }else{
+    wet_order<-1
+  }
   
   #Create simple output
   output<-tibble(
@@ -1043,22 +1024,19 @@ fun<-function(n){
 output<-mclapply(X=seq(1, nrow(giws)), 
                  FUN = fun, 
                  mc.cores=detectCores()) %>% bind_rows()
-  
+
 #join to giws tibble
 giws<-left_join(giws, output)
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#13.0 Final export===================================================================
+#13.0 Export Results============================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-output<-giws %>% st_drop_geometry() %>% rename(max_depth = z)
+#Export SF shapes
+st_write(giws, paste0(data_dir, "III_Products/giws.shp"), delete_layer = T)
+st_write(flowpath, paste0(data_dir, "III_Products/flowpath.shp"), delete_layer = T)
+st_write(subsheds, paste0(data_dir, "III_Products/subsheds.shp"), delete_layer = T)
+st_write(watersheds, paste0(data_dir, "III_Products/watersheds.shp"), delete_layer = T)
 
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#Plot for funzies===============================================================
-#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-plot(dem)
-streams %>% plot(., col="dodgerblue4", add=T)
-giws %>% filter(is.na(merge_to)) %>% select(wet_order) %>%  plot(., add=T)
-#giws %>% filter(spawned == 0)  %>% st_geometry() %>% plot(., add=T, col="dodgerblue2")
-subsheds %>% st_geometry() %>% plot(., add=T, lcol="grey80", lwd=0.5)
-flowpath %>% st_geometry() %>% plot(., add=T, border="dodgerblue2")
-pp %>% st_geometry() %>% plot(., add=T, pch=19, col="grey30")
+#Export raster
+writeRaster(dem_filter, paste0(data_dir, "III_Products/dem_filter.tif"), overwrite=T)
+
