@@ -15,6 +15,7 @@ rm(list=ls(all=TRUE))
 data_dir<-"//nfs/palmer-group-data/choptank/Nate/Spatial_Analysis/"
 
 #Download packages 
+library(htmlwidgets)
 library(leaflet)
 library(whitebox)
 library(stars)
@@ -107,6 +108,13 @@ flowpaths %>% st_transform(., crs=4326) %>% leaflet(.) %>% addPolygons(.)
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.0 Plot data==================================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#Fix output items for display
+wetlands<- wetlands %>% 
+  mutate(wetland_hsc_cm = if_else(is.na(wetland_hsc_cm), 
+                                  merged_hsc_cm, 
+                                  wetland_hsc_cm))
+
+
 #Convert to coorindate systems [from planar]
 site_bndry<-site_bndry %>% st_transform(.,crs=4326)
 wetlands <- wetlands %>% st_transform(., crs = 4326)
@@ -123,18 +131,17 @@ labels <- sprintf(
   "<strong>WetID = %s</strong>
    <br/>Watershed Area = %g ha
    <br/>Network Order = %g
-   <br/>Nested Wetlands = %g
    <br/>P/A Ratio = %g
    <br/>HSC [Wetland] = %g cm
    <br/>HSC [Watershed] = %g cm
    <br/>HAND = %g m
    <br/>HANS = %g m",
-   wetlands$WetID, wetlands$watershed_area_m2/10000, wetlands$wet_order, wetlands$spawned, wetlands$p_a_ratio, 
+   wetlands$WetID, wetlands$watershed_area_m2/10000, wetlands$wet_order, wetlands$p_a_ratio, 
    wetlands$wetland_hsc_cm, wetlands$watershed_hsc_cm, wetlands$hand_m, wetlands$hans_m
 ) %>% lapply(htmltools::HTML)
 
 #leaflet
-leaflet(wetlands) %>% 
+m<-leaflet(wetlands) %>% 
   #Add Basemaps
   addProviderTiles("Esri.WorldImagery", group = "ESRI") %>% 
   addTiles(group = "OSM") %>%
@@ -173,5 +180,7 @@ leaflet(wetlands) %>%
                                      "SW Connections", 
                                      "TNC Property"
                                      ))
-  
+
+#Save map as html document
+saveWidget(m, file="site_selection.html")
   
