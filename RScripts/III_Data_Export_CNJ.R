@@ -36,7 +36,9 @@ sites<-st_as_sf(sites, coords = c("POINT_X", "POINT_Y"), crs = 2248)
 sites<-st_transform(sites, crs = p)
 
 #define intersections
-df<- st_join(sites, giws) %>% filter(spawned==0) %>% filter(wet_order<10) %>% filter(Wetland!="DF") %>% st_drop_geometry()
+df<- st_join(sites, giws) %>%  filter(wet_order<12) %>% st_drop_geometry()
+
+
   
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #2.0 Initial Analysis ==========================================================
