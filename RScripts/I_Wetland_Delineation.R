@@ -1,7 +1,7 @@
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Title: Spatial Analysis
 #Coder: C. Nathan Jones (cnjones7@ua.edu)
-#Date: 8/14/2019
+#Date: 11/3/2019
 #Purpose: Examine hydrogeomorphic features accross Delmarva Bay wetland sites
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -30,16 +30,18 @@ p<-"+proj=utm +zone=17 +ellps=GRS80 +datum=NAD83 +units=m +no_defs"
 
 #Download relevant data 
 dem<-raster(paste0(data_dir,"I_Data/2007_1m_DEM.tif"))
-#dem<-raster(paste0(data_dir,"I_Data/dem_jr"))
-dem[dem<0]<-NA
-dem<-projectRaster(dem, crs=p)  
+  dem[dem<0]<-NA
+  dem<-projectRaster(dem, crs=p)  
 streams<-st_read(paste0(data_dir, "I_Data/TotalStreamNetwork_UCRW.shp"))
-streams<-st_transform(streams, crs=p)
-streams<-st_crop(streams, dem)
-
+  streams<-st_transform(streams, crs=p)
+  streams<-st_crop(streams, dem)
+burn<-st_read(paste0(data_dir, "I_Data/FN_GB_Wetland_Burn.shp"))
+  burn<-st_transform(burn, crs=p)
+  
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#2.0 Filter the DEM=============================================================
+#2.0 Prep DEM for Analysis======================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#2.1 Filter the DEM-------------------------------------------------------------
 #Export DEM to workspace
 writeRaster(dem, paste0(data_dir,"II_Work/dem.tif"), overwrite=T)
 
@@ -54,16 +56,44 @@ dem_fill<-raster(paste0(data_dir,"II_Work/dem_fill.tif"))
 dem_filter<- focal(dem_fill, w=focalWeight(dem, 3, "Gauss"))
 crs(dem_filter)<-p
 
+#2.2 Burn Wetlands of interest into DEM-----------------------------------------
+#Create DEM urn Function~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+GIW_burn<-function(
+  dem,   #DEM in question 
+  burn){ #Wetland Polygon
+  
+  #Create DEM mask
+  mask<-rasterize(burn, dem, 1)
+  dem_mask<-mask*dem
+  
+  #Create minimum raster
+  dem_min<-cellStats(dem_mask, base::min, na.rm=T)
+  dem_min<-dem_mask*0+dem_min
+  dem_min[is.na(dem_min)]<-0
+  
+  #Replace masked location with min raster value
+  dem_mask<-dem_mask*0
+  dem_mask[is.na(dem_mask)]<-1
+  dem<-dem*dem_mask+dem_min
+  
+  #Export DEM
+  dem
+}
+
+#Apply function to wetlands of interest
+dem_burn<-GIW_burn(dem=dem_filter, burn=burn[1,])
+dem_burn<-GIW_burn(dem=dem_filter, burn=burn[2,])
+
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.0 Define "Root" Depressions==================================================
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #3.1 Use the Stochastic Deprresion Tool to identify deprresions-----------------
 #Export fitlered DEM to workspace
-writeRaster(dem_filter, paste0(data_dir,"II_Work/dem_filter.tif"), overwrite=T)
+writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
 
 #Apply stochastic depressin analysis tool
 set.seed(100)
-stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_filter.tif"), 
+stochastic_depression_analysis(dem = paste0(data_dir,"II_Work/dem_burn.tif"), 
                                output = paste0(data_dir,"II_Work/giws.tif"), 
                                rmse = 0.18, 
                                range = 10, 
@@ -113,7 +143,7 @@ giws$WetID<-seq(1, nrow(giws))
 #https://github.com/giswqs/lidar/blob/master/lidar/slicing.py
 
 #4.1 Create function to execute level set method individual basins--------------
-fun<-function(n, giws, dem_filter, max_size = 250, n_slices = 10){
+fun<-function(n, giws, dem_burn, max_size = 250, n_slices = 10){
   
   #Identify GIW
   giw<-giws[n,]
@@ -124,7 +154,7 @@ fun<-function(n, giws, dem_filter, max_size = 250, n_slices = 10){
   }
   
   #Crop DEM
-  temp<-crop(dem_filter, giw)
+  temp<-crop(dem_burn, giw)
   temp<-mask(temp, giw)
   
   #Create Minimum Raster
@@ -200,7 +230,7 @@ fun<-function(n, giws, dem_filter, max_size = 250, n_slices = 10){
 
 #4.2 Apply function-------------------------------------------------------------
 outside_fun<-function(x){
-  tryCatch(fun(x, giws, dem_filter, max_size = 250, n_slices = 10), 
+  tryCatch(fun(x, giws, dem_burn, max_size = 250, n_slices = 10), 
            error = function(e) NA)
 }
 
@@ -253,7 +283,7 @@ giws<-giws %>%
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #5.1 Create flow accumulation and flow direction rasters------------------------
 #Export raster to workspace
-writeRaster(dem_filter, paste0(data_dir, "II_Work/dem.tif"), overwrite=T)
+writeRaster(dem_burn, paste0(data_dir, "II_Work/dem.tif"), overwrite=T)
 
 #Execute breach tool
 breach_depressions(dem = paste0(data_dir,"II_Work/dem.tif"), 
@@ -460,7 +490,7 @@ pp<-fp %>%
 #6.2.1 Subshed Delineation~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #Write shpaes to workspace
 st_write(pp, paste0(data_dir, "II_Work/pp.shp"), delete_layer=T)
-writeRaster(dem_filter, paste0(data_dir, "II_Work/dem.tif"), overwrite=T)
+writeRaster(dem_burn, paste0(data_dir, "II_Work/dem.tif"), overwrite=T)
 
 #Conduct watershed analysis
 watershed(d8_pntr = paste0(data_dir, "II_Work/fdr.tif"), 
@@ -845,14 +875,14 @@ stream_grd<-streams %>%
   #Create negative buffer
   st_buffer(., -1) %>% 
   #FASTERIZE!
-  fasterize(., dem_filter)
+  fasterize(., dem_burn)
 
 #Write to workspace
 writeRaster(stream_grd, paste0(data_dir, "II_Work/stream.tif"), overwrite = T)
-writeRaster(dem_filter, paste0(data_dir,"II_Work/dem_filter.tif"), overwrite=T)
+writeRaster(dem_burn, paste0(data_dir,"II_Work/dem_burn.tif"), overwrite=T)
 
 #Conduct breach analysis
-breach_depressions(dem = paste0(data_dir,"II_Work/dem_filter.tif"), 
+breach_depressions(dem = paste0(data_dir,"II_Work/dem_burn.tif"), 
                    fill_pits = T, 
                    flat_increment = 0.001, 
                    output = paste0(data_dir,"II_Work/dem_breach.tif"))
@@ -871,7 +901,7 @@ hand_grd<-raster(paste0(data_dir, "II_Work/hand.tif"))
 hand_grd[hand_grd>100]<-NA
 
 #Crop out stream grid
-stream_grd<-streams %>% fasterize(., dem_filter)
+stream_grd<-streams %>% fasterize(., dem_burn)
 stream_grd<-stream_grd*0
 stream_grd[is.na(stream_grd)]<-1
 stream_grd[stream_grd==0]<-NA
@@ -1038,5 +1068,5 @@ st_write(subsheds, paste0(data_dir, "III_Products/subsheds.shp"), delete_layer =
 st_write(watersheds, paste0(data_dir, "III_Products/watersheds.shp"), delete_layer = T)
 
 #Export raster
-writeRaster(dem_filter, paste0(data_dir, "III_Products/dem_filter.tif"), overwrite=T)
-
+writeRaster(dem_burn, paste0(data_dir, "III_Products/dem_burn.tif"), overwrite=T)
+save.image('backup_20191103.RData')

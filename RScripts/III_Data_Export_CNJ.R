@@ -38,6 +38,8 @@ sites<-st_transform(sites, crs = p)
 #define intersections
 df<- st_join(sites, giws) %>%  filter(wet_order<12) %>% st_drop_geometry()
 
+#Export df to output
+write_csv(df, paste0(data_dir, "III_products/output.csv"))
 
   
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
